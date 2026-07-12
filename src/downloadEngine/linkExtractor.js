@@ -1,7 +1,7 @@
 // Matches both current MEGA URLs (mega.nz/file/xxx#key, mega.nz/folder/xxx#key)
 // and the legacy format (mega.nz/#!xxx!key or mega.nz/#F!xxx!key).
 const MEGA_LINK_REGEX =
-  /https?:\/\/mega\.nz\/(?:file|folder)\/[a-zA-Z0-9_-]+(?:#[a-zA-Z0-9_!-]+)?|https?:\/\/mega\.nz\/#(?:F!|!)[a-zA-Z0-9_-]+(?:![a-zA-Z0-9_-]+)?/gi;
+  /https?:\/\/mega\.nz\/(?:file|folder)\/[a-zA-Z0-9_-]+#[a-zA-Z0-9_!-]+|https?:\/\/mega\.nz\/#(?:F!|!)[a-zA-Z0-9_-]+![a-zA-Z0-9_-]+/gi;
 
 // Looks for "password: xyz", "pass - xyz", "pwd: xyz", etc. The value is
 // whatever non-whitespace token follows, optionally wrapped in ` or * (as
