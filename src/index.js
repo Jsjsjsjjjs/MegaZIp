@@ -59,9 +59,29 @@ const { startMirrorEngine, stopMirrorEngine } = require('./mirrorEngine');
 const { parseTxtFile }   = require('./txtLinkIngester');
 const { retryWithBackoff } = require('./utils/retry');
 
-// ── Config ────────────────────────────────────────────────────────────────────
+// ── Config ─────────────────────────────────────────────────────────────────────
 const configPath = path.join(__dirname, '..', 'config', 'config.json');
-const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+let config = {};
+try {
+  config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+} catch {
+  console.log('[index] config/config.json not found — using defaults (env vars will override).');
+  config = {
+    watchFolder: './watched-folder',
+    channelNameTemplate: '{name}',
+    channelNameBoldStyle: false,
+    messageTemplate: '**{name}**\n🔗 Link: {link}\n🔑 Password: {password}',
+    zipPasswordMode: 'auto-random',
+    zipInputPassword: '',
+    uploadDelaySeconds: 8,
+    processingConcurrency: 2,
+    deleteEncryptedAfterUpload: true,
+    guiPort: 3737,
+    advancedTemplate: { useEmbed: false },
+    downloadEngine: { enabled: false, downloadFolder: './downloads', concurrentDownloads: 2, retryCount: 3, timeoutMs: 180000 },
+    mirrorEngine: { enabled: false, concurrency: 2, channelTimeoutMs: 30000, downloadTimeoutMs: 300000 },
+  };
+}
 
 // Apply environment variable overrides.
 // Environment variables always win over config.json values.
