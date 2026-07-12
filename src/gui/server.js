@@ -138,8 +138,12 @@ function startGuiServer(config, handlers = {}) {
         try { onIngestZip(f.path); } catch (err) {
           console.error(`[gui] ingestZip error for "${f.originalname}": ${err.message}`);
         }
+      } else if (ext === '.txt' && typeof onIngestTxt === 'function') {
+        // Explicitly trigger txt ingestion — chokidar may not fire reliably on hosting
+        try { onIngestTxt(f.path); } catch (err) {
+          console.error(`[gui] ingestTxt error for "${f.originalname}": ${err.message}`);
+        }
       }
-      // .txt files are picked up automatically by the folder watcher
     }
 
     res.json({ ok: true, uploaded: names });

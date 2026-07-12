@@ -121,14 +121,26 @@ if (process.env.ZIP_PASSWORD_MODE)
   config.zipPasswordMode = process.env.ZIP_PASSWORD_MODE;
 
 // ── Folder paths ──────────────────────────────────────────────────────────────
-// On Railway the /app directory is read-only after deploy; use /tmp for temp files.
-// Watched folder and downloads still use configured paths but fall back to /tmp.
-const watchFolderPath    = path.resolve(__dirname, '..', config.watchFolder   || './watched-folder');
+// Railway's /app is read-only after deploy. Detect this and use /tmp instead.
+function resolveWritableDir(...segments) {
+  const preferred = path.resolve(...segments);
+  // Test if parent is writable
+  try { fs.accessSync(path.parse(preferred).root === preferred ? preferred : path.dirname(preferred), fs.constants.W_OK); return preferred; }
+  catch { /* read-only */ }
+  // Fall back: replace the /app prefix with /tmp
+  const relative = path.relative(path.join(__dirname, '..'), preferred);
+  return path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', relative);
+}
+
+const watchFolderPath    = resolveWritableDir(__dirname, '..', config.watchFolder   || './watched-folder');
 const stagingFolderPath  = path.join(watchFolderPath, 'staging');
-const downloadFolderPath = path.resolve(__dirname, '..', config.downloadEngine?.downloadFolder || './downloads');
+const downloadFolderPath = resolveWritableDir(__dirname, '..', config.downloadEngine?.downloadFolder || './downloads');
+
+console.log(`[index] Watch folder: ${watchFolderPath}`);
+console.log(`[index] Download folder: ${downloadFolderPath}`);
 
 for (const dir of [watchFolderPath, stagingFolderPath, downloadFolderPath]) {
-  try { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); }
+  try { fs.mkdirSync(dir, { recursive: true }); }
   catch (e) { console.warn(`[index] Could not create dir ${dir}: ${e.message}`); }
 }
 
@@ -250,12 +262,8 @@ async function processZip(filename, rawZipPath, meta = {}) {
       );
       updateState(filename, { status: 'uploaded', megaLink, error: null });
       console.log(`[index] Uploaded "${filename}" → ${megaLink}`);
-      safeDelete(encryptedPath);
-      // Also try to remove the empty 'encrypted' dir
-      try {
-        const encDir = path.dirname(encryptedPath);
-        if (fs.existsSync(encDir) && fs.readdirSync(encDir).length === 0) fs.rmdirSync(encDir);
-      } catch {}
+      // Delete the entire temp encrypted dir (created by mkdtempSync in zipEncryptor)
+      try { fs.rmSync(path.dirname(encryptedPath), { recursive: true, force: true }); } catch {}
     } catch (err) {
       console.error(`[index] MEGA upload failed for "${filename}": ${err.message}`);
       updateState(filename, { status: 'failed', error: `MEGA upload: ${err.message}` });
@@ -465,6 +473,7 @@ async function main() {
     onDownloadCancel: cancelDownloads,
     onIngestLink:     downloadAndIngest,
     onIngestZip:      ingestUploadedZip,
+    onIngestTxt:      handleTxtFile,
     watchFolderPath,
   });
 

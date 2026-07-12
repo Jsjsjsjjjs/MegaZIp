@@ -15,6 +15,15 @@ try {
 // Path to the bundled 7za binary (works on Windows/Linux/macOS with no system install)
 const SEVEN_ZIP = sevenBin.path7za;
 
+// Ensure execute permissions on Linux/macOS to avoid EACCES errors
+try {
+  if (process.platform !== 'win32') {
+    fs.chmodSync(SEVEN_ZIP, 0o755);
+  }
+} catch (e) {
+  console.warn(`[zipEncryptor] Failed to chmod 7za: ${e.message}`);
+}
+
 /**
  * Generates a random, human-typeable password (avoids visually confusing
  * characters like 0/O/1/l/I).
@@ -91,14 +100,12 @@ async function encryptZip(zipPath, password, inputPassword = null) {
   const finalPassword = password && password.length > 0 ? password : generatePassword(12);
   const baseName = path.basename(zipPath, path.extname(zipPath));
   const tempExtractDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mzb-extract-'));
-  const outputDir = path.join(path.dirname(zipPath), 'encrypted');
+  // Always write encrypted output to a temp dir — never next to the source file,
+  // which may be on a read-only filesystem (Railway /app).
+  const outputDir  = fs.mkdtempSync(path.join(os.tmpdir(), 'mzb-enc-'));
   const outputPath = path.join(outputDir, `${baseName}.zip`);
 
   try {
-    if (!fs.existsSync(outputDir)) {
-      fs.mkdirSync(outputDir, { recursive: true });
-    }
-
     // 1. Detect whether source ZIP is encrypted
     const encrypted = await isZipEncrypted(zipPath);
 

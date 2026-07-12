@@ -148,8 +148,15 @@ function validateZip(filePath) {
 
 async function processDownloadJob(job) {
   const dlConfig = sharedConfig.downloadEngine || {};
-  const downloadFolder = path.resolve(dlConfig.downloadFolder || './downloads');
-  if (!fs.existsSync(downloadFolder)) fs.mkdirSync(downloadFolder, { recursive: true });
+  // Use /tmp/downloads as fallback if the configured path is not writable
+  let downloadFolder = path.resolve(dlConfig.downloadFolder || './downloads');
+  try {
+    fs.mkdirSync(downloadFolder, { recursive: true });
+    fs.accessSync(downloadFolder, fs.constants.W_OK);
+  } catch {
+    downloadFolder = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'downloads');
+    fs.mkdirSync(downloadFolder, { recursive: true });
+  }
 
   const tempPath = path.join(downloadFolder, `${Date.now()}-${Math.random().toString(36).slice(2)}.zip`);
 
