@@ -48,7 +48,7 @@ const { uploadToMega }   = require('../megaUploader');
 const { createZipChannel } = require('../discordManager');
 const { sendZipMessage } = require('../webhookSender');
 const downloadManager    = require('../downloadEngine/downloadManager');
-const { extractMegaLinks, extractSuggestedName } = require('../downloadEngine/linkExtractor');
+const { extractMegaLinks, extractSuggestedName, flattenEmbed } = require('../downloadEngine/linkExtractor');
 const { getClient }      = require('../discordClient');
 
 try {
@@ -321,12 +321,9 @@ async function scanChannel(channel, timeoutMs) {
 
       if (Array.isArray(msg.embeds)) {
         for (const embed of msg.embeds) {
-          const parts = [
-            embed.title, embed.description, embed.url,
-            ...(embed.fields || []).map(f => f.value),
-          ].filter(Boolean).join(' ');
-          for (const link of extractMegaLinks(parts)) {
-            const embedName = extractSuggestedName(parts) || embed.title || channelName;
+          const embedText = flattenEmbed(embed);
+          for (const link of extractMegaLinks(embedText)) {
+            const embedName = extractSuggestedName(embedText) || embed.title || channelName;
             results.push({ link, name: embedName, categoryName });
           }
         }
@@ -341,12 +338,12 @@ async function scanChannel(channel, timeoutMs) {
 
 // ─── Scan all guilds for MEGA links ──────────────────────────────────────────
 async function scanAllGuilds(config, selfbot) {
-  const mc              = config.mirrorEngine;
-  const srcGuildIds     = Array.isArray(mc.sourceGuildIds)    ? mc.sourceGuildIds    : [];
-  const excGuilds       = new Set(Array.isArray(mc.excludeGuildIds)   ? mc.excludeGuildIds   : []);
-  const excChannels     = new Set(Array.isArray(mc.excludeChannelIds) ? mc.excludeChannelIds : []);
-  const chTimeout = mc.channelTimeoutMs || 30_000; // 30s per channel total
-  const BATCH     = 16; // concurrent channels per batch (faster scan)
+  const mc          = config.mirrorEngine;
+  const srcGuildIds = Array.isArray(mc.sourceGuildIds)    ? mc.sourceGuildIds    : [];
+  const excGuilds   = new Set(Array.isArray(mc.excludeGuildIds)   ? mc.excludeGuildIds   : []);
+  const excChannels = new Set(Array.isArray(mc.excludeChannelIds) ? mc.excludeChannelIds : []);
+  const chTimeout   = mc.channelTimeoutMs || 30_000;
+  const BATCH       = 16;
 
   let guilds = srcGuildIds.length
     ? srcGuildIds.map(id => selfbot.guilds.cache.get(id)).filter(Boolean)
@@ -356,30 +353,39 @@ async function scanAllGuilds(config, selfbot) {
   const all = [];
 
   for (const guild of guilds) {
-    console.log(`[mirrorEngine] Scanning: ${guild.name}`);
+    console.log(`[mirrorEngine] ── Guild: ${guild.name}`);
 
     let chCollection;
     try { chCollection = await guild.channels.fetch(); }
     catch (e) { console.warn(`[mirrorEngine]   ⚠ ${guild.name}: ${e.message}`); continue; }
 
-    // Only text-capable channels
     const channels = [...chCollection.values()].filter(
       ch => ch && typeof ch.messages?.fetch === 'function' && !excChannels.has(ch.id)
     );
 
-    console.log(`[mirrorEngine]   ${channels.length} text channels`);
+    const total = channels.length;
+    console.log(`[mirrorEngine]   ${total} text channel(s) to scan`);
 
-    // Batch concurrent scans
+    // Batch concurrent scans with progress
     for (let i = 0; i < channels.length; i += BATCH) {
-      const batch = channels.slice(i, i + BATCH);
+      const batch     = channels.slice(i, i + BATCH);
+      const batchNum  = Math.floor(i / BATCH) + 1;
+      const batchTotal = Math.ceil(total / BATCH);
+      const names     = batch.map(c => `#${c.name}`).join(', ');
+      console.log(`[mirrorEngine]   Batch ${batchNum}/${batchTotal}: ${names}`);
+
       const results = await Promise.allSettled(
         batch.map(ch => scanChannel(ch, chTimeout))
       );
+      let batchFound = 0;
       for (const r of results) {
-        if (r.status === 'fulfilled') all.push(...r.value);
+        if (r.status === 'fulfilled') { all.push(...r.value); batchFound += r.value.length; }
       }
+      console.log(`[mirrorEngine]   Batch ${batchNum}/${batchTotal} done — ${batchFound} link(s) found (total so far: ${all.length})`);
       if (i + BATCH < channels.length) await sleep(300);
     }
+
+    console.log(`[mirrorEngine]   ✓ ${guild.name} scan complete — ${all.length} link(s) found total`);
   }
 
   return all;

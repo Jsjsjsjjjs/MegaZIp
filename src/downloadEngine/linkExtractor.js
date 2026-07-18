@@ -31,28 +31,68 @@ function extractSuggestedName(content) {
 }
 
 /**
+ * Collects all text from a Discord embed into one searchable string.
+ * Covers: title, description, url, all field values, footer text, author name/url.
+ * @param {import('discord.js').MessageEmbed} embed
+ * @returns {string}
+ */
+function flattenEmbed(embed) {
+  const parts = [];
+  if (embed.title)       parts.push(embed.title);
+  if (embed.description) parts.push(embed.description);
+  if (embed.url)         parts.push(embed.url);
+  if (embed.author) {
+    if (embed.author.name) parts.push(embed.author.name);
+    if (embed.author.url)  parts.push(embed.author.url);
+  }
+  if (embed.footer && embed.footer.text) parts.push(embed.footer.text);
+  if (Array.isArray(embed.fields)) {
+    for (const field of embed.fields) {
+      if (field.name)  parts.push(field.name);
+      if (field.value) parts.push(field.value);
+    }
+  }
+  return parts.join(' ');
+}
+
+/**
  * Extracts every candidate download job from a single Discord message.
- * Returns [] if the message has no valid MEGA link (per the requirement to
- * ignore anything without one).
+ * Scans both the plain message text AND all embeds attached to the message.
+ * Returns [] if no valid MEGA link (with decryption key) is found anywhere.
  *
  * @param {import('discord.js').Message} message
  * @returns {Array<{link: string, password: string|null, suggestedName: string|null, sourceMessageId: string, sourceChannelId: string}>}
  */
 function extractJobsFromMessage(message) {
-  const content = message.content || '';
-  const links = extractMegaLinks(content);
-  if (links.length === 0) return [];
+  const content   = message.content || '';
+  const allLinks  = new Set(extractMegaLinks(content));
+  const allText   = [content];
 
-  const password = extractPassword(content);
-  const suggestedName = extractSuggestedName(content);
+  // Also scan every embed attached to this message
+  if (Array.isArray(message.embeds)) {
+    for (const embed of message.embeds) {
+      const embedText = flattenEmbed(embed);
+      if (embedText) {
+        allText.push(embedText);
+        for (const link of extractMegaLinks(embedText)) allLinks.add(link);
+      }
+    }
+  }
 
-  return links.map((link) => ({
+  if (allLinks.size === 0) return [];
+
+  // Try to find a password and a suggested name from all available text combined
+  const combinedText = allText.join(' ');
+  const password     = extractPassword(combinedText);
+  const suggestedName = extractSuggestedName(combinedText);
+
+  return [...allLinks].map((link) => ({
     link,
     password,
     suggestedName,
-    sourceMessageId: message.id,
-    sourceChannelId: message.channelId,
+    sourceMessageId:  message.id,
+    sourceChannelId:  message.channelId,
   }));
 }
 
-module.exports = { extractMegaLinks, extractPassword, extractSuggestedName, extractJobsFromMessage };
+module.exports = { extractMegaLinks, extractPassword, extractSuggestedName, flattenEmbed, extractJobsFromMessage };
