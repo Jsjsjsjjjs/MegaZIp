@@ -28,14 +28,35 @@ function getStorage(config) {
 
     storage.once('ready', () => resolve(storage));
     storage.once('error', (err) => {
-      if (err && err.message && (err.message.includes('-9') || err.message.includes('ENOENT'))) {
-        reject(new Error(
-          `MEGA login failed — user not found. ` +
-          `Check megaEmail (${config.megaEmail}) and megaPassword in config.json.`
-        ));
-      } else {
-        reject(err);
+      storagePromise = null;
+      const msg = err?.message || String(err);
+
+      // ── Permanent account-level errors — no point retrying ──────────────
+      if (msg.includes('-16') || msg.includes('EBLOCKED')) {
+        const e = new Error(
+          'MEGA account is BLOCKED by MEGA. Log into mega.nz, complete any verification, ' +
+          'or switch to a different MEGA account in your Railway MEGA_EMAIL / MEGA_PASSWORD variables.'
+        );
+        e.nonRetryable = true;
+        return reject(e);
       }
+      if (msg.includes('-17') || msg.includes('EOVERQUOTA')) {
+        const e = new Error(
+          'MEGA account storage quota exceeded. Free up space on mega.nz or use a different account.'
+        );
+        e.nonRetryable = true;
+        return reject(e);
+      }
+      if (msg.includes('-9') || msg.includes('ENOENT')) {
+        const e = new Error(
+          `MEGA login failed — wrong email/password. ` +
+          `Check MEGA_EMAIL (${config.megaEmail}) and MEGA_PASSWORD in your environment variables.`
+        );
+        e.nonRetryable = true;
+        return reject(e);
+      }
+
+      reject(err);
     });
   });
 
