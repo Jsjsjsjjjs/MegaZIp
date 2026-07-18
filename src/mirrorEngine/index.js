@@ -425,10 +425,23 @@ async function runWithConcurrency(items, concurrency, fn) {
 let _selfbot = null;
 let _started = false;
 
-function startMirrorEngine(config) {
+function getMirrorEngineStatus() {
+  const counts = Object.values(_state).reduce((a, v) => { a[v.status] = (a[v.status]||0)+1; return a; }, {});
+  return {
+    started: _started,
+    stateCounts: counts
+  };
+}
+
+/**
+ * Starts the mirror engine.
+ * @param {object} config
+ * @param {boolean} [force=false] - Bypass mc.enabled config check
+ */
+async function startMirrorEngine(config, force = false) {
   const mc = config.mirrorEngine;
 
-  if (!mc?.enabled) {
+  if (!force && !mc?.enabled) {
     console.log('[mirrorEngine] Disabled — skipping.');
     return;
   }
@@ -539,4 +552,4 @@ function stopMirrorEngine() {
   if (_selfbot) { _selfbot.destroy(); _selfbot = null; }
 }
 
-module.exports = { startMirrorEngine, stopMirrorEngine };
+module.exports = { startMirrorEngine, stopMirrorEngine, getMirrorEngineStatus };

@@ -304,19 +304,33 @@ async function processZip(filename, rawZipPath, meta = {}) {
     }
   }
 
-  // ── Step 4: Send message ─────────────────────────────────────────────────
+  // ── Step 4: Send or Edit message ─────────────────────────────────────────
   try {
-    const sentMessage = await retryWithBackoff(
-      () => sendZipMessage(channel, { name: baseName, link: megaLink, password }, config),
-      {
-        retries: 3,
-        delaysMs: [2000, 5000, 10000],
-        onAttemptFail: (attempt, err) =>
-          console.warn(`[index] Message send attempt ${attempt} failed for "${filename}": ${err.message}`),
-      }
-    );
+    let messageId = state.messageId;
+    if (messageId) {
+      await retryWithBackoff(
+        () => require('./webhookSender').editZipMessage(channel, messageId, { name: baseName, link: megaLink, password }, config),
+        {
+          retries: 3,
+          delaysMs: [2000, 5000, 10000],
+          onAttemptFail: (attempt, err) =>
+            console.warn(`[index] Message edit attempt ${attempt} failed for "${filename}": ${err.message}`),
+        }
+      );
+      console.log(`[index] Edited existing message: ${messageId}`);
+    } else {
+      const sentMessage = await retryWithBackoff(
+        () => sendZipMessage(channel, { name: baseName, link: megaLink, password }, config),
+        {
+          retries: 3,
+          delaysMs: [2000, 5000, 10000],
+          onAttemptFail: (attempt, err) =>
+            console.warn(`[index] Message send attempt ${attempt} failed for "${filename}": ${err.message}`),
+        }
+      );
+      messageId = sentMessage?.id || null;
+    }
 
-    const messageId = sentMessage?.id || null;
     updateState(filename, { status: 'message_sent', messageId, error: null });
 
     appendLog({ filename, megaLink, zipPassword: password, channelId: channel.id, channelName: channel.name, messageId });
@@ -459,7 +473,15 @@ async function main() {
   if (config.discordClientId) {
     try {
       await registerCommands(config);
-      attachCommandHandler(client, config);
+      attachCommandHandler(client, config, {
+        regenerateChannel,
+        startMirrorEngine,
+        stopMirrorEngine,
+        getMirrorEngineStatus,
+        pauseDownloads,
+        resumeDownloads,
+        cancelDownloads
+      });
       console.log('[index] Slash commands registered.');
     } catch (err) {
       console.warn(`[index] Slash commands unavailable: ${err.message}`);
@@ -515,3 +537,44 @@ process.on('SIGTERM', () => { stopMirrorEngine(); process.exit(0); });
 process.on('unhandledRejection', (reason) => {
   console.error('[index] Unhandled rejection:', reason instanceof Error ? reason.message : reason);
 });
+
+async function regenerateChannel(channelId) {
+  const allStates = getAllStates() || {};
+  const entry = Object.entries(allStates).find(([_, st]) => st.channelId === channelId);
+  if (!entry) throw new Error('No tracked file found for this channel ID.');
+  const [filename, state] = entry;
+  const oldLink = state.megaLink;
+  if (!oldLink) throw new Error('No existing MEGA link found in state to regenerate from.');
+
+  console.log(`[index] Starting regeneration for channel ${channelId} (${filename})`);
+
+  // Download old file
+  const dlFolder = downloadFolderPath;
+  if (!fs.existsSync(dlFolder)) fs.mkdirSync(dlFolder, { recursive: true });
+  const tempPath = path.join(dlFolder, `${Date.now()}-regen-${filename}`);
+
+  await downloadManager.downloadMegaFile(oldLink, tempPath, { timeoutMs: 300000 });
+
+  // Stage it
+  const stagedPath = path.join(stagingFolderPath, filename);
+  if (fs.existsSync(stagedPath)) {
+    try { fs.unlinkSync(stagedPath); } catch {}
+  }
+  fs.copyFileSync(tempPath, stagedPath);
+  try { fs.unlinkSync(tempPath); } catch {}
+
+  // Update state keeping messageId and channelId so we EDIT the old message instead of posting a new one!
+  updateState(filename, {
+    status: 'new',
+    megaLink: null,
+    encryptedPath: null,
+    // Use the stored zipPassword as the input password to decrypt the downloaded file
+    sourcePassword: state.zipPassword || config.zipInputPassword || null,
+    error: null,
+  });
+
+  enqueue(filename, stagedPath);
+  return filename;
+}
+
+module.exports = { regenerateChannel };
