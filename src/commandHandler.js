@@ -11,6 +11,9 @@ const configPath = path.join(__dirname, '..', 'config', 'config.json');
 /**
  * Registers all slash commands for a single guild.
  */
+/**
+ * Registers all slash commands for a single guild and globally.
+ */
 async function registerCommands(config) {
   if (!config.discordClientId) {
     throw new Error('discordClientId missing in config.json (needed to register slash commands)');
@@ -60,6 +63,14 @@ async function registerCommands(config) {
       .toJSON(),
 
     new SlashCommandBuilder()
+      .setName('regen')
+      .setDescription('Alias for /regenerate (owner only)')
+      .addChannelOption((o) =>
+        o.setName('channel').setDescription('Target channel to regenerate and update').setRequired(true).addChannelTypes(ChannelType.GuildText)
+      )
+      .toJSON(),
+
+    new SlashCommandBuilder()
       .setName('mirror')
       .setDescription('Control the mirror engine (owner only)')
       .addStringOption((o) =>
@@ -96,9 +107,28 @@ async function registerCommands(config) {
   ];
 
   const rest = new REST({ version: '10' }).setToken(config.discordToken);
-  await rest.put(Routes.applicationGuildCommands(config.discordClientId, config.guildId), {
-    body: commands,
-  });
+
+  // 1. Register to the target guild (instant update)
+  if (config.guildId) {
+    try {
+      await rest.put(Routes.applicationGuildCommands(config.discordClientId, config.guildId), {
+        body: commands,
+      });
+      console.log(`[commandHandler] Successfully registered guild slash commands for guild ${config.guildId}`);
+    } catch (err) {
+      console.error(`[commandHandler] Guild slash command registration failed: ${err.message}`);
+    }
+  }
+
+  // 2. Register globally (works in all servers, but cached by Discord over time)
+  try {
+    await rest.put(Routes.applicationCommands(config.discordClientId), {
+      body: commands,
+    });
+    console.log('[commandHandler] Successfully registered global slash commands');
+  } catch (err) {
+    console.error(`[commandHandler] Global slash command registration failed: ${err.message}`);
+  }
 }
 
 /**
@@ -309,7 +339,7 @@ function attachCommandHandler(client, config, actions = {}) {
     }
 
     // ── /regenerate ──────────────────────────────────────────────────────────
-    if (interaction.commandName === 'regenerate') {
+    if (interaction.commandName === 'regenerate' || interaction.commandName === 'regen') {
       const channel = interaction.options.getChannel('channel', true);
       await interaction.deferReply({ ephemeral: true });
       try {
