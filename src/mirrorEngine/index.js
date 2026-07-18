@@ -343,7 +343,7 @@ async function scanAllGuilds(config, selfbot) {
   const excGuilds   = new Set(Array.isArray(mc.excludeGuildIds)   ? mc.excludeGuildIds   : []);
   const excChannels = new Set(Array.isArray(mc.excludeChannelIds) ? mc.excludeChannelIds : []);
   const chTimeout   = mc.channelTimeoutMs || 30_000;
-  const BATCH       = 16;
+  const BATCH       = 6;
 
   let guilds = srcGuildIds.length
     ? srcGuildIds.map(id => selfbot.guilds.cache.get(id)).filter(Boolean)
@@ -382,7 +382,7 @@ async function scanAllGuilds(config, selfbot) {
         if (r.status === 'fulfilled') { all.push(...r.value); batchFound += r.value.length; }
       }
       console.log(`[mirrorEngine]   Batch ${batchNum}/${batchTotal} done — ${batchFound} link(s) found (total so far: ${all.length})`);
-      if (i + BATCH < channels.length) await sleep(300);
+      if (i + BATCH < channels.length) await sleep(1500);
     }
 
     console.log(`[mirrorEngine]   ✓ ${guild.name} scan complete — ${all.length} link(s) found total`);
