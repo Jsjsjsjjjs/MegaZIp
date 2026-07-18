@@ -1,60 +1,44 @@
 'use strict';
 
+/**
+ * virusTotal.js — VirusTotal v3 API client
+ *
+ * Uses Node's built-in `https` module only (no extra dependencies).
+ * Free-tier API key works — just set VIRUSTOTAL_API_KEY in Railway env vars.
+ */
+
 const https = require('https');
 const crypto = require('crypto');
 const fs = require('fs');
 
-/**
- * Computes the SHA-256 hash of a file on disk.
- * @param {string} filePath 
- * @returns {Promise<string>}
- */
-function getFileSha256(filePath) {
-  return new Promise((resolve, reject) => {
-    const hash = crypto.createHash('sha256');
-    const stream = fs.createReadStream(filePath);
-    stream.on('data', (data) => hash.update(data));
-    stream.on('end', () => resolve(hash.digest('hex')));
-    stream.on('error', (err) => reject(err));
-  });
-}
-
-/**
- * Helper to make HTTPS requests to the VirusTotal API v3.
- */
-function vtRequest(endpoint, method, apiKey, postData = null) {
+// ── Internal: make an authenticated request to VT v3 API ─────────────────────
+function vtRequest(method, path, apiKey, postData = null) {
   return new Promise((resolve, reject) => {
     const options = {
       hostname: 'www.virustotal.com',
-      path: endpoint,
-      method: method,
+      path,
+      method,
       headers: {
         'x-apikey': apiKey,
-        'accept': 'application/json',
-      }
+        'Accept': 'application/json',
+      },
     };
 
     if (postData) {
-      options.headers['content-type'] = 'application/x-www-form-urlencoded';
+      options.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+      options.headers['Content-Length'] = Buffer.byteLength(postData);
     }
 
     const req = https.request(options, (res) => {
       let data = '';
-      res.on('data', (chunk) => data += chunk);
+      res.on('data', (chunk) => { data += chunk; });
       res.on('end', () => {
+        if (res.statusCode === 404) return resolve(null); // not found on VT — not an error
         if (res.statusCode >= 200 && res.statusCode < 300) {
-          try {
-            resolve(JSON.parse(data));
-          } catch (e) {
-            reject(new Error('Invalid JSON response from VirusTotal'));
-          }
+          try { resolve(JSON.parse(data)); }
+          catch { reject(new Error(`VirusTotal response is not valid JSON (status ${res.statusCode})`)); }
         } else {
-          try {
-            const parsed = JSON.parse(data);
-            reject(new Error(parsed.error?.message || `VirusTotal HTTP Error ${res.statusCode}`));
-          } catch {
-            reject(new Error(`VirusTotal HTTP Error ${res.statusCode}`));
-          }
+          reject(new Error(`VirusTotal API error: HTTP ${res.statusCode} — ${data.slice(0, 200)}`));
         }
       });
     });
@@ -65,46 +49,58 @@ function vtRequest(endpoint, method, apiKey, postData = null) {
   });
 }
 
-/**
- * Retrieves report for a file SHA-256 hash.
- */
-async function getFileReport(hash, apiKey) {
-  try {
-    const res = await vtRequest(`/api/v3/files/${hash}`, 'GET', apiKey);
-    return res.data;
-  } catch (err) {
-    if (err.message.includes('not found') || err.message.includes('404')) {
-      return null; // Not scanned yet
-    }
-    throw err;
-  }
+// ── Compute SHA-256 hash of a local file ──────────────────────────────────────
+function getFileSha256(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('error', reject);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+  });
 }
 
 /**
- * Submits a URL for scanning and returns the analysis object.
+ * Submit a URL to VirusTotal for reputation analysis.
+ * Returns the full VT analysis attributes object.
+ * @param {string} url
+ * @param {string} apiKey
  */
 async function scanUrl(url, apiKey) {
-  // Convert URL to Base64 (without padding, as VT API v3 expects)
-  const urlId = Buffer.from(url).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  try {
-    const res = await vtRequest(`/api/v3/urls/${urlId}`, 'GET', apiKey);
-    return res.data;
-  } catch (err) {
-    // If not found, submit for analysis
-    if (err.message.includes('not found') || err.message.includes('404')) {
-      const submit = await vtRequest('/api/v3/urls', 'POST', apiKey, `url=${encodeURIComponent(url)}`);
-      const analysisId = submit.data?.id;
-      // Wait 3 seconds for analysis to run
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      const report = await vtRequest(`/api/v3/analyses/${analysisId}`, 'GET', apiKey);
-      return report.data;
+  const encoded = encodeURIComponent(url);
+  // First: try to get an existing analysis
+  const urlId = Buffer.from(url).toString('base64url').replace(/=/g, '');
+  let report = await vtRequest('GET', `/api/v3/urls/${urlId}`, apiKey);
+
+  if (!report) {
+    // Submit for fresh scan
+    const submitRes = await vtRequest('POST', '/api/v3/urls', apiKey, `url=${encoded}`);
+    const analysisId = submitRes?.data?.id;
+    if (!analysisId) throw new Error('VirusTotal did not return an analysis ID for URL scan.');
+
+    // Poll until done (max 10 attempts × 3s)
+    for (let i = 0; i < 10; i++) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const analysis = await vtRequest('GET', `/api/v3/analyses/${analysisId}`, apiKey);
+      if (analysis?.data?.attributes?.status === 'completed') {
+        report = analysis;
+        break;
+      }
     }
-    throw err;
   }
+
+  return report?.data || null;
 }
 
-module.exports = {
-  getFileSha256,
-  getFileReport,
-  scanUrl,
-};
+/**
+ * Look up a file by SHA-256 hash on VirusTotal.
+ * Returns null if not found (never submitted).
+ * @param {string} sha256
+ * @param {string} apiKey
+ */
+async function getFileReport(sha256, apiKey) {
+  const result = await vtRequest('GET', `/api/v3/files/${sha256}`, apiKey);
+  return result?.data || null;
+}
+
+module.exports = { scanUrl, getFileReport, getFileSha256 };

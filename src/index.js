@@ -485,7 +485,6 @@ async function main() {
     try {
       await registerCommands(config);
       attachCommandHandler(client, config, {
-        regenerateChannel,
         startMirrorEngine,
         stopMirrorEngine,
         getMirrorEngineStatus,
@@ -557,39 +556,37 @@ async function startRegeneration(channelId) {
   const oldLink = state.megaLink;
   if (!oldLink) throw new Error('No existing MEGA link found in state to regenerate from.');
 
-  // Run the download and staging asynchronously in the background
-  (async () => {
+  // Validate immediately — throw before Discord times out
+  console.log(`[index] Queuing background regeneration for channel ${channelId} (${filename})`);
+
+  // Run the slow download + enqueue in the background
+  setImmediate(async () => {
     try {
-      console.log(`[index] Starting background regeneration for channel ${channelId} (${filename})`);
       const dlFolder = downloadFolderPath;
       if (!fs.existsSync(dlFolder)) fs.mkdirSync(dlFolder, { recursive: true });
       const tempPath = path.join(dlFolder, `${Date.now()}-regen-${filename}`);
 
-      await downloadManager.downloadMegaFile(oldLink, tempPath, { timeoutMs: 300000 });
+      await downloadManager.downloadMegaFile(oldLink, tempPath, { timeoutMs: 300_000 });
 
       const stagedPath = path.join(stagingFolderPath, filename);
-      if (fs.existsSync(stagedPath)) {
-        try { fs.unlinkSync(stagedPath); } catch {}
-      }
+      if (fs.existsSync(stagedPath)) { try { fs.unlinkSync(stagedPath); } catch {} }
       fs.copyFileSync(tempPath, stagedPath);
       try { fs.unlinkSync(tempPath); } catch {}
 
       updateState(filename, {
-        status: 'new',
-        megaLink: null,
-        encryptedPath: null,
+        status:         'new',
+        megaLink:       null,
+        encryptedPath:  null,
         sourcePassword: state.zipPassword || config.zipInputPassword || null,
-        error: null,
+        error:          null,
       });
 
       enqueue(filename, stagedPath);
-      console.log(`[index] Successfully enqueued background regeneration for "${filename}"`);
+      console.log(`[index] Background regeneration enqueued for "${filename}"`);
     } catch (err) {
       console.error(`[index] Background regeneration failed for "${filename}": ${err.message}`);
     }
-  })();
+  });
 
-  return filename;
+  return filename; // returned immediately so Discord gets a reply right away
 }
-
-module.exports = { regenerateChannel: startRegeneration };
