@@ -484,12 +484,13 @@ function attachCommandHandler(client, config, actions = {}) {
   client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
+    const cmd = interaction.commandName;
+    console.log(`[commandHandler] Incoming command: /${cmd} from user: ${interaction.user.tag} (${interaction.user.id})`);
+
     // ── Owner-only guard ──────────────────────────────────────────────────────
     if (config.botOwnerId && interaction.user.id !== config.botOwnerId) {
       return interaction.reply({ ephemeral: true, content: '🚫 This command is only available to the bot owner.' });
     }
-
-    const cmd = interaction.commandName;
 
     try {
       if (cmd === 'status')            return await handleStatus(interaction, config);
@@ -501,6 +502,12 @@ function attachCommandHandler(client, config, actions = {}) {
       if (cmd === 'mirror')             return await handleMirror(interaction, config, actions);
       if (cmd === 'pipeline')           return await handlePipeline(interaction, actions);
       if (cmd === 'invalidatesession')  return await handleInvalidateSession(interaction);
+
+      // Default fallback for any stale registered commands (e.g. /regenerate)
+      await interaction.reply({
+        ephemeral: true,
+        content: `⚠️ Slash command \`/${cmd}\` is not supported by the active version of the bot.\n💡 Run the reset command to clean up old commands:\n\`npm run reset-commands\``
+      });
     } catch (err) {
       console.error(`[commandHandler] Unhandled error in /${cmd}: ${err.message}`);
       const payload = { ephemeral: true, content: `❌ An unexpected error occurred: ${err.message}` };
