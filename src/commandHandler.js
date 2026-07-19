@@ -556,10 +556,36 @@ async function handleDcheck(interaction, client, config) {
     }
   }
 
+  // ── Clean up empty categories ──────────────────────────────────────────────
+  let deletedCats = 0;
+  if (!dryRun) {
+    try {
+      await guild.channels.fetch(); // refresh cache
+      for (const ch of guild.channels.cache.values()) {
+        if (ch.type === 4) { // Category = 4
+          const children = guild.channels.cache.filter((child) => child.parentId === ch.id);
+          if (children.size === 0) {
+            const name = ch.name;
+            if (name.startsWith('◜📂 〢') || name.toLowerCase().includes('stock server') || name.toLowerCase().includes('uploads')) {
+              try {
+                await ch.delete('Empty category cleanup by /dcheck');
+                deletedCats++;
+              } catch (err) {
+                console.warn(`[commandHandler] /dcheck failed to delete category "${name}" (${ch.id}): ${err.message}`);
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[commandHandler] /dcheck category cleanup fetch failed: ${err.message}`);
+    }
+  }
+
   const lines = [
     dryRun
       ? `🔍 **DRY RUN Results** — **${deleted}** channel(s) would be deleted:`
-      : `✅ **Done** — **${deleted}** duplicate(s) deleted${failed > 0 ? `, **${failed}** failed` : ''}:`,
+      : `✅ **Done** — **${deleted}** duplicate channel(s) deleted${deletedCats > 0 ? ` and **${deletedCats}** empty category/categories deleted` : ''}${failed > 0 ? `, **${failed}** failed` : ''}:`,
     '',
     ...report.slice(0, 20), // cap at 20 lines to avoid Discord 2000-char limit
     report.length > 20 ? `…and ${report.length - 20} more group(s)` : '',
