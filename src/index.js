@@ -47,7 +47,7 @@ if (fs.existsSync(envFilePath)) {
 const { watchFolder }    = require('./folderWatcher');
 const { encryptZip }     = require('./zipEncryptor');
 const { uploadToMega }   = require('./megaUploader');
-const { createZipChannel } = require('./discordManager');
+const { createZipChannel, addToBatch } = require('./discordManager');
 const { sendZipMessage } = require('./webhookSender');
 const { getClient }      = require('./discordClient');
 const { registerCommands, attachCommandHandler } = require('./commandHandler');
@@ -151,6 +151,9 @@ let activeCount = 0;
 const queue       = [];
 const queuedFiles = new Set();
 
+// Per-filename lock — prevents two concurrent workers processing the same file
+const _processingLocks = new Set();
+
 function enqueue(filename, rawZipPath, meta = {}) {
   if (queuedFiles.has(filename)) return;
   queuedFiles.add(filename);
@@ -178,6 +181,20 @@ function drainQueue() {
 
 // ── Main pipeline ─────────────────────────────────────────────────────────────
 async function processZip(filename, rawZipPath, meta = {}) {
+  // Per-filename lock: skip if another worker is already processing this file
+  if (_processingLocks.has(filename)) {
+    console.warn(`[index] "${filename}" already in progress — skipping duplicate.`);
+    return;
+  }
+  _processingLocks.add(filename);
+  try {
+    return await _processZipInner(filename, rawZipPath, meta);
+  } finally {
+    _processingLocks.delete(filename);
+  }
+}
+
+async function _processZipInner(filename, rawZipPath, meta = {}) {
   const baseName = path.basename(filename, path.extname(filename));
   let state = getState(filename) || {};
 
@@ -273,19 +290,19 @@ async function processZip(filename, rawZipPath, meta = {}) {
   }
 
   // ── Step 3: Discord channel ──────────────────────────────────────────────
-  let channel  = null;
-  let batchMode = state.batchMode || false;
+  let channel      = null;
+  let batchMode    = state.batchMode || false;
+  let batchGuild   = null;
   let placeholderMsgId = state.placeholderMsgId || null;
 
-  if (state.channelId) {
+  if (state.channelId && !batchMode) {
     try {
       const client = await getClient(config);
       channel = await client.channels.fetch(state.channelId);
-      batchMode = state.batchMode || false;
     } catch { channel = null; }
   }
 
-  if (!channel) {
+  if (!channel && !batchMode) {
     try {
       const channelOptions = {
         sourceCategoryName: state.sourceCategoryName || meta.sourceCategoryName || null,
@@ -301,17 +318,25 @@ async function processZip(filename, rawZipPath, meta = {}) {
       );
       channel   = result.channel;
       batchMode = result.batchMode || false;
-      updateState(filename, { status: 'channel_created', channelId: channel.id, batchMode, error: null });
+      batchGuild = result.guild || null;
 
-      // Post a placeholder message so users see activity in the channel right away
-      if (!batchMode && !placeholderMsgId) {
-        try {
-          const wh = await channel.fetchWebhooks().then(whs => whs.find(w => w.name === 'ZipBot Delivery') ||
-            channel.createWebhook({ name: 'ZipBot Delivery' }));
-          const ph = await wh.send({ content: `⏳ **${baseName}** — uploading to MEGA, please wait…` });
-          placeholderMsgId = ph.id;
-          updateState(filename, { placeholderMsgId });
-        } catch { /* placeholder is best-effort */ }
+      if (!batchMode) {
+        updateState(filename, { status: 'channel_created', channelId: channel.id, batchMode: false, error: null });
+
+        // Post a placeholder so users see activity while MEGA upload is in progress
+        if (!placeholderMsgId) {
+          try {
+            const whs = await channel.fetchWebhooks();
+            const wh  = whs.find(w => w.name === 'ZipBot Delivery') ||
+                        await channel.createWebhook({ name: 'ZipBot Delivery' });
+            const ph  = await wh.send({ content: `⏳ **${baseName}** — link uploading to MEGA, please wait…` });
+            placeholderMsgId = ph.id;
+            updateState(filename, { placeholderMsgId });
+          } catch { /* placeholder is best-effort */ }
+        }
+      } else {
+        // Batch mode — guild at channel limit; channel will be managed by addToBatch
+        updateState(filename, { status: 'channel_created', batchMode: true, error: null });
       }
     } catch (err) {
       console.error(`[index] Channel creation failed for "${filename}": ${err.message}`);
@@ -323,21 +348,18 @@ async function processZip(filename, rawZipPath, meta = {}) {
   // ── Step 4: Send / update message ────────────────────────────────────────
   try {
     if (batchMode) {
-      // Batch embed mode: guild at channel limit — post a compact embed to the batch channel
-      await channel.send({
-        embeds: [{
-          color: 0x5865F2,
-          title: baseName,
-          description: `🔗 ${megaLink}\n🔑 \`${password}\``,
-          timestamp: new Date().toISOString(),
-        }],
-      });
-      updateState(filename, { status: 'message_sent', messageId: null, error: null });
+      // Batch embed mode — serialized via mutex in discordManager
+      // Fetch guild if not already available
+      if (!batchGuild) {
+        const client = await getClient(config);
+        batchGuild   = await client.guilds.fetch(config.guildId);
+      }
+      await addToBatch(batchGuild, config, baseName, megaLink);
+      updateState(filename, { status: 'message_sent', messageId: null, placeholderMsgId: null, error: null });
     } else {
-      // Normal mode: send/edit via webhook
+      // Normal mode — send or edit placeholder via webhook
       let sentMessage;
       if (placeholderMsgId) {
-        // Edit the placeholder instead of sending a new message
         const { editZipMessage } = require('./webhookSender');
         await editZipMessage(channel, placeholderMsgId, { name: baseName, link: megaLink, password }, config);
         sentMessage = { id: placeholderMsgId };
@@ -356,7 +378,11 @@ async function processZip(filename, rawZipPath, meta = {}) {
       updateState(filename, { status: 'message_sent', messageId, placeholderMsgId: null, error: null });
     }
 
-    appendLog({ filename, megaLink, zipPassword: password, channelId: channel.id, channelName: channel.name, messageId: state.messageId });
+    appendLog({
+      filename, megaLink, zipPassword: password,
+      channelId: channel?.id || 'batch', channelName: channel?.name || 'batch',
+      messageId: state.messageId,
+    });
     console.log(`[index] ✅ Done: "${filename}"`);
   } catch (err) {
     console.error(`[index] Message failed for "${filename}": ${err.message}`);
