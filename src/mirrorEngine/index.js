@@ -59,23 +59,33 @@ try {
 }
 
 // ─── Paths ────────────────────────────────────────────────────────────────────
-// Use /tmp for state and temp on read-only hosts (Railway). Fall back to project root locally.
-function resolveWritablePath(preferred) {
-  try {
-    fs.accessSync(path.dirname(preferred), fs.constants.W_OK);
-    return preferred;
-  } catch {
-    const tmp = process.env.TMPDIR || process.env.TEMP || '/tmp';
-    return path.join(tmp, path.basename(preferred));
+// Storage priority:
+//   1. /data/  — Railway Volume (persistent across restarts)
+//   2. project root — local dev
+//   3. /tmp    — ephemeral fallback
+function resolveWritablePath(filename) {
+  const candidates = [
+    process.env.STATE_DIR ? path.join(process.env.STATE_DIR, filename) : null,
+    path.join('/data', filename),
+    path.join(__dirname, '..', '..', filename),
+    path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', filename),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      const dir = path.dirname(candidate);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.accessSync(dir, fs.constants.W_OK);
+      return candidate;
+    } catch { /* try next */ }
   }
+  return path.join('/tmp', filename);
 }
 
-const STATE_PATH = resolveWritablePath(path.join(__dirname, '..', '..', 'mirror-state.json'));
-const TEMP_DIR   = (() => {
-  const preferred = path.join(__dirname, '..', '..', 'mirror-temp');
-  try { fs.accessSync(path.dirname(preferred), fs.constants.W_OK); return preferred; }
-  catch { return path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'mirror-temp'); }
-})();
+const STATE_PATH = resolveWritablePath('mirror-state.json');
+const TEMP_DIR   = resolveWritablePath('mirror-temp');
+// Ensure temp dir exists as a directory
+try { fs.mkdirSync(TEMP_DIR, { recursive: true }); } catch {}
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));

@@ -14,7 +14,12 @@ function getClient(config) {
       return reject(new Error('discordToken missing in config.json'));
     }
 
-    const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+    const client = new Client({
+      intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+      ],
+    });
 
     client.once('ready', () => resolve(client));
     client.once('error', (err) => reject(err));

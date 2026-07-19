@@ -490,7 +490,9 @@ async function main() {
         getMirrorEngineStatus,
         pauseDownloads,
         resumeDownloads,
-        cancelDownloads
+        cancelDownloads,
+        downloadManager,        // for /check file download
+        regenerateChannel: startRegeneration,  // for /regen
       });
       console.log('[index] Slash commands registered.');
     } catch (err) {

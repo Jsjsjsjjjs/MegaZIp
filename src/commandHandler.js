@@ -273,18 +273,22 @@ async function handleUpdateposts(interaction, client, config) {
   });
 }
 
-async function handleCheck(interaction, config) {
+async function handleCheck(interaction, config, actions) {
   const apiKey = process.env.VIRUSTOTAL_API_KEY || config.virusTotalApiKey;
   if (!apiKey) {
     return interaction.reply({
       ephemeral: true,
-      content: '❌ **VirusTotal API Key not configured.**\nAdd `VIRUSTOTAL_API_KEY` to your Railway Variables and redeploy.\nGet a free key at https://www.virustotal.com/gui/join-us',
+      content: [
+        '❌ **VirusTotal API Key not configured.**',
+        'Add `VIRUSTOTAL_API_KEY` to your Railway Variables and redeploy.',
+        'Get a free key at https://www.virustotal.com/gui/join-us',
+      ].join('\n'),
     });
   }
 
   await interaction.deferReply({ ephemeral: true });
 
-  // Resolve target MEGA link
+  // ── Resolve target MEGA link ─────────────────────────────────────────────
   let megaLink = interaction.options.getString('link') || null;
   if (!megaLink) {
     const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
@@ -294,74 +298,81 @@ async function handleCheck(interaction, config) {
   }
 
   if (!megaLink) {
-    return interaction.editReply({ content: '❌ No MEGA link found. Specify a `link:` or a `channel:` that contains one.' });
+    return interaction.editReply({
+      content: '❌ No MEGA link found. Use `link:` to paste one directly, or specify a `channel:` that has one.',
+    });
   }
 
-  await interaction.editReply({ content: `🔍 Found link: \`${megaLink}\`\nQuerying VirusTotal URL reputation…` });
+  await interaction.editReply({ content: `🔍 Link found: \`${megaLink}\`\n⏳ Querying VirusTotal URL reputation database…` });
 
   try {
     // ── Phase 1: URL reputation ──────────────────────────────────────────────
     const urlReport = await scanUrl(megaLink, apiKey);
     const urlStats  = urlReport?.attributes?.last_analysis_stats;
 
-    let urlStatusLine = '⚠️ *No scan data available yet*';
-    let vtUrlId       = '';
-    let vtUrlLink     = '';
+    let urlStatusLine = '⚠️ *No reputation data available yet on VirusTotal*';
+    // Safe base64 URL-encode (works on Node 14+ without base64url flag)
+    const vtUrlId   = Buffer.from(megaLink).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    const vtUrlLink = `https://www.virustotal.com/gui/url/${vtUrlId}/detection`;
 
     if (urlStats) {
       const mal = urlStats.malicious || 0;
       urlStatusLine = mal > 0
         ? `🚨 **${mal} engine(s) flagged as malicious**`
-        : `🟢 **Clean — 0 malicious detections**`;
-      vtUrlId   = Buffer.from(megaLink).toString('base64url').replace(/=/g, '');
-      vtUrlLink = `https://www.virustotal.com/gui/url/${vtUrlId}/detection`;
+        : `🟢 **Clean — 0 malicious flags**`;
     }
 
-    const phase1Text = [
-      '🔍 **VirusTotal Scan Results**',
-      '',
-      '**① URL Reputation**',
-      `• Result: ${urlStatusLine}`,
-      vtUrlLink ? `• Report: ${vtUrlLink}` : '',
-      '',
-      '*⏳ Now downloading the file to compute its SHA-256 hash for a deep payload scan…*',
-    ].filter(Boolean).join('\n');
+    await interaction.editReply({
+      content: [
+        '🔍 **VirusTotal Scan — Phase 1: URL Reputation**',
+        `• Result: ${urlStatusLine}`,
+        `• Full report: ${vtUrlLink}`,
+        '',
+        '*⏳ Downloading the file to compute SHA-256 hash for deep payload scan…*',
+        '*(This may take a minute for large files)*',
+      ].join('\n'),
+    });
 
-    await interaction.editReply({ content: phase1Text });
+    // ── Phase 2: File hash scan (optional — skip if download fails) ──────────
+    let fileSection = '**② File Payload Scan:** ⚠️ *Download skipped or failed — URL scan above is still valid.*';
 
-    // ── Phase 2: File hash scan ──────────────────────────────────────────────
-    const tmpDir  = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'vt-scan');
-    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-    const tmpFile = path.join(tmpDir, `${Date.now()}-vt.zip`);
+    try {
+      const tmpDir  = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'vt-scan');
+      fs.mkdirSync(tmpDir, { recursive: true });
+      const tmpFile = path.join(tmpDir, `${Date.now()}-vt.zip`);
 
-    const dlManager = require('./downloadEngine/downloadManager');
-    await dlManager.downloadMegaFile(megaLink, tmpFile, { timeoutMs: 120_000 });
+      // Use the shared downloadManager instance (already init'd by index.js)
+      const dlManager = actions.downloadManager || require('./downloadEngine/downloadManager');
+      await dlManager.downloadMegaFile(megaLink, tmpFile, { timeoutMs: 120_000 });
 
-    const sha256 = await getFileSha256(tmpFile);
-    try { fs.unlinkSync(tmpFile); } catch {}
+      const sha256     = await getFileSha256(tmpFile);
+      try { fs.unlinkSync(tmpFile); } catch {}
 
-    const vtFileLink = `https://www.virustotal.com/gui/file/${sha256}/detection`;
-    const fileReport = await getFileReport(sha256, apiKey);
+      const vtFileLink = `https://www.virustotal.com/gui/file/${sha256}/detection`;
+      const fileReport = await getFileReport(sha256, apiKey);
 
-    let fileSection;
-    if (fileReport) {
-      const fs2 = fileReport.attributes?.last_analysis_stats || {};
-      const mal = fs2.malicious || 0;
-      const sus = fs2.suspicious || 0;
-      const ok  = fs2.harmless  || 0;
-      fileSection = [
-        `**② File Payload Scan (SHA-256: \`${sha256.slice(0, 16)}…\`)**`,
-        `• Result: ${mal > 0 ? `🚨 **${mal} malicious** detections` : '🟢 **Clean**'}`,
-        `• Stats: ${ok} safe · ${sus} suspicious · ${mal} malicious`,
-        `• Full report: ${vtFileLink}`,
-      ].join('\n');
-    } else {
-      fileSection = [
-        `**② File Payload Scan**`,
-        `• SHA-256: \`${sha256}\``,
-        `• Status: 📭 *Not found on VirusTotal — file has not been submitted before.*`,
-        `• Submit manually: ${vtFileLink}`,
-      ].join('\n');
+      if (fileReport) {
+        const fs2 = fileReport.attributes?.last_analysis_stats || {};
+        const mal = fs2.malicious  || 0;
+        const sus = fs2.suspicious || 0;
+        const ok  = fs2.harmless   || 0;
+        fileSection = [
+          `**② File Payload Scan (SHA-256: \`${sha256.slice(0, 16)}…\`)**`,
+          `• Result: ${mal > 0 ? `🚨 **${mal} malicious detections**` : '🟢 **Clean**'}`,
+          `• Stats: ${ok} safe · ${sus} suspicious · ${mal} malicious`,
+          `• Full report: ${vtFileLink}`,
+        ].join('\n');
+      } else {
+        fileSection = [
+          `**② File Payload Scan**`,
+          `• SHA-256: \`${sha256}\``,
+          `• Status: 📭 *File not found on VirusTotal — not yet submitted.*`,
+          `• Submit manually: ${vtFileLink}`,
+        ].join('\n');
+      }
+    } catch (dlErr) {
+      console.warn(`[commandHandler] /check phase2 download failed: ${dlErr.message}`);
+      fileSection = `**② File Payload Scan:** ⚠️ *Download failed: ${dlErr.message}*\nURL reputation above is still valid.`;
     }
 
     await interaction.editReply({
@@ -370,15 +381,17 @@ async function handleCheck(interaction, config) {
         '',
         '**① URL Reputation**',
         `• Result: ${urlStatusLine}`,
-        vtUrlLink ? `• Report: ${vtUrlLink}` : '',
+        `• Report: ${vtUrlLink}`,
         '',
         fileSection,
-      ].filter(Boolean).join('\n'),
+      ].join('\n'),
     });
 
   } catch (err) {
     console.error(`[commandHandler] /check error: ${err.message}`);
-    await interaction.editReply({ content: `❌ Scan failed: ${err.message}` });
+    try {
+      await interaction.editReply({ content: `❌ VirusTotal scan failed: ${err.message}` });
+    } catch { /* interaction may have expired */ }
   }
 }
 
@@ -484,30 +497,23 @@ function attachCommandHandler(client, config, actions = {}) {
   client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
-    const cmd = interaction.commandName;
-    console.log(`[commandHandler] Incoming command: /${cmd} from user: ${interaction.user.tag} (${interaction.user.id})`);
-
     // ── Owner-only guard ──────────────────────────────────────────────────────
     if (config.botOwnerId && interaction.user.id !== config.botOwnerId) {
       return interaction.reply({ ephemeral: true, content: '🚫 This command is only available to the bot owner.' });
     }
+
+    const cmd = interaction.commandName;
 
     try {
       if (cmd === 'status')            return await handleStatus(interaction, config);
       if (cmd === 'settemplate')        return await handleSettemplate(interaction, config);
       if (cmd === 'toggleembed')        return await handleToggleembed(interaction, config);
       if (cmd === 'updateposts')        return await handleUpdateposts(interaction, client, config);
-      if (cmd === 'check')              return await handleCheck(interaction, config);
+      if (cmd === 'check')              return await handleCheck(interaction, config, actions);
       if (cmd === 'regen')              return await handleRegen(interaction, actions);
       if (cmd === 'mirror')             return await handleMirror(interaction, config, actions);
       if (cmd === 'pipeline')           return await handlePipeline(interaction, actions);
       if (cmd === 'invalidatesession')  return await handleInvalidateSession(interaction);
-
-      // Default fallback for any stale registered commands (e.g. /regenerate)
-      await interaction.reply({
-        ephemeral: true,
-        content: `⚠️ Slash command \`/${cmd}\` is not supported by the active version of the bot.\n💡 Run the reset command to clean up old commands:\n\`npm run reset-commands\``
-      });
     } catch (err) {
       console.error(`[commandHandler] Unhandled error in /${cmd}: ${err.message}`);
       const payload = { ephemeral: true, content: `❌ An unexpected error occurred: ${err.message}` };
