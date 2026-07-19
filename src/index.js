@@ -55,7 +55,7 @@ const { updateState, getState, getAllStates, appendLog, removeState } = require(
 const { startGuiServer } = require('./gui/server');
 const { startDownloadEngine, pauseDownloads, resumeDownloads, cancelDownloads } = require('./downloadEngine');
 const downloadManager    = require('./downloadEngine/downloadManager');
-const { startMirrorEngine, stopMirrorEngine, getMirrorEngineStatus } = require('./mirrorEngine');
+const { startMirrorEngine, stopMirrorEngine, getMirrorEngineStatus, resetMirrorState } = require('./mirrorEngine');
 const { parseTxtFile }   = require('./txtLinkIngester');
 const { retryWithBackoff } = require('./utils/retry');
 
@@ -146,7 +146,7 @@ for (const dir of [watchFolderPath, stagingFolderPath, downloadFolderPath]) {
 }
 
 // ── Concurrent queue ──────────────────────────────────────────────────────────
-const MAX_CONCURRENT = Math.max(1, parseInt(config.processingConcurrency || 2));
+const MAX_CONCURRENT = Math.max(1, parseInt(config.processingConcurrency || 4));
 let activeCount = 0;
 const queue       = [];
 const queuedFiles = new Set();
@@ -465,6 +465,7 @@ async function main() {
           getStatus: getMirrorEngineStatus,
           start:  () => startMirrorEngine(config),
           stop:   stopMirrorEngine,
+          reset:  resetMirrorState,
         },
         pipelineControls: {
           pause:   pauseDownloads,

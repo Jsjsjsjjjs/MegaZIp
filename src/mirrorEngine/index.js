@@ -464,8 +464,16 @@ function startMirrorEngine(config) {
     }
   } catch {}
 
-  // Load state and reset stale in-progress entries
-  loadState();
+  // Support RESET_MIRROR_STATE env var for Railway-based recovery
+  if (process.env.RESET_MIRROR_STATE === 'true') {
+    console.log('[mirrorEngine] RESET_MIRROR_STATE=true — clearing state for fresh run.');
+    _state = {};
+    try { if (fs.existsSync(STATE_PATH)) fs.unlinkSync(STATE_PATH); } catch {}
+  } else {
+    // Load state and reset stale in-progress entries
+    loadState();
+  }
+
   const STALE = ['downloading', 'encrypting', 'uploading', 'channel_creating'];
   let resetCount = 0;
   for (const [k, v] of Object.entries(_state)) {
@@ -512,7 +520,7 @@ function startMirrorEngine(config) {
 
 async function runEngine(config) {
   const mc          = config.mirrorEngine;
-  const concurrency = Math.max(1, mc.concurrency || 2);
+  const concurrency = Math.max(1, mc.concurrency || 4); // default 4 for speed
 
   _engineStatus.running   = true;
   _engineStatus.lastRunAt = new Date().toISOString();
@@ -558,4 +566,17 @@ function stopMirrorEngine() {
   if (_selfbot) { _selfbot.destroy(); _selfbot = null; }
 }
 
-module.exports = { startMirrorEngine, stopMirrorEngine, getMirrorEngineStatus };
+/**
+ * Clears all mirror state so the engine re-processes every link from scratch.
+ * Useful for recovery after accidental channel deletion.
+ * @returns {number} Number of entries cleared
+ */
+function resetMirrorState() {
+  const count = Object.keys(_state).length;
+  _state = {};
+  try { if (fs.existsSync(STATE_PATH)) fs.unlinkSync(STATE_PATH); } catch {}
+  console.log(`[mirrorEngine] State reset — cleared ${count} entries.`);
+  return count;
+}
+
+module.exports = { startMirrorEngine, stopMirrorEngine, getMirrorEngineStatus, resetMirrorState };

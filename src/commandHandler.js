@@ -14,6 +14,10 @@ const { scanFile }                       = require('./vtScanner');
 const configPath = path.join(__dirname, '..', 'config', 'config.json');
 
 // ── Unicode bold → ASCII normaliser (for /dcheck) ────────────────────────────
+// Maps Mathematical Bold characters only.
+// ⚠️  IMPORTANT: We do NOT strip emoji, brackets, pipes, or any other characters.
+// Two channels are duplicates ONLY if after bold→ASCII conversion they are
+// character-for-character identical (case-insensitive).
 const BOLD_UNICODE_MAP = {
   '𝗔':'A','𝗕':'B','𝗖':'C','𝗗':'D','𝗘':'E','𝗙':'F','𝗚':'G','𝗛':'H','𝗜':'I','𝗝':'J',
   '𝗞':'K','𝗟':'L','𝗠':'M','𝗡':'N','𝗢':'O','𝗣':'P','𝗤':'Q','𝗥':'R','𝗦':'S','𝗧':'T',
@@ -22,19 +26,21 @@ const BOLD_UNICODE_MAP = {
   '𝗸':'k','𝗹':'l','𝗺':'m','𝗻':'n','𝗼':'o','𝗽':'p','𝗾':'q','𝗿':'r','𝘀':'s','𝘁':'t',
   '𝘂':'u','𝘃':'v','𝘄':'w','𝘅':'x','𝘆':'y','𝘇':'z',
   '𝟬':'0','𝟭':'1','𝟮':'2','𝟯':'3','𝟰':'4','𝟱':'5','𝟲':'6','𝟳':'7','𝟴':'8','𝟵':'9',
-  // Italic bold
   '𝘼':'A','𝘽':'B','𝘾':'C','𝘿':'D','𝙀':'E','𝙁':'F','𝙂':'G','𝙃':'H','𝙄':'I','𝙅':'J',
   '𝙆':'K','𝙇':'L','𝙈':'M','𝙉':'N','𝙊':'O','𝙋':'P','𝙌':'Q','𝙍':'R','𝙎':'S','𝙏':'T',
   '𝙐':'U','𝙑':'V','𝙒':'W','𝙓':'X','𝙔':'Y','𝙕':'Z',
 };
 
+/**
+ * Convert bold unicode → ASCII, then lowercase.
+ * Does NOT strip any other characters — two channels must be truly identical
+ * (modulo bold styling and letter case) to be considered duplicates.
+ */
 function normalizeChannelName(name) {
   if (!name) return '';
-  // Replace bold unicode chars
   let out = '';
   for (const ch of name) out += BOLD_UNICODE_MAP[ch] || ch;
-  // Strip Discord-illegal chars, collapse whitespace, lowercase
-  return out.replace(/[^\w\s\-\.]/g, '').replace(/\s+/g, '-').toLowerCase().trim();
+  return out.toLowerCase();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -115,7 +121,7 @@ async function registerCommands(config) {
       )
       .toJSON(),
 
-    // ── /mirror — Mirror engine control ───────────────────────────────────────
+    // ── /mirror — Mirror engine control ──────────────────────────────────────────────
     new SlashCommandBuilder()
       .setName('mirror')
       .setDescription('Mirror engine controls (owner only)')
@@ -127,6 +133,7 @@ async function registerCommands(config) {
             { name: 'status', value: 'status' },
             { name: 'start',  value: 'start'  },
             { name: 'stop',   value: 'stop'   },
+            { name: 'reset',  value: 'reset'  },
           )
       )
       .toJSON(),
@@ -257,6 +264,18 @@ function attachCommandHandler(client, config, {
       } else if (action === 'stop') {
         if (mirrorControls.stop) { mirrorControls.stop(); await interaction.reply({ content: '⏹️ Mirror engine stopping...', ephemeral: true }); }
         else await interaction.reply({ content: '⚠️ Mirror engine controls not available.', ephemeral: true });
+      } else if (action === 'reset') {
+        // Clears mirror state so the engine re-scans from channel #1 on the next start.
+        // Use this for recovery after accidental channel deletion.
+        if (mirrorControls.reset) {
+          const cleared = mirrorControls.reset();
+          await interaction.reply({
+            content: `🔄 **Mirror state reset!** Cleared **${cleared}** tracked link(s).\nThe engine will re-scan everything from scratch on the next \`/mirror start\`.`,
+            ephemeral: true,
+          });
+        } else {
+          await interaction.reply({ content: '⚠️ Mirror reset not available.', ephemeral: true });
+        }
       }
       return;
     }
