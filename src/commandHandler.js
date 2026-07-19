@@ -112,6 +112,15 @@ const COMMAND_DEFS = [
     .setName('invalidatesession')
     .setDescription('Clear the saved MEGA session — forces a fresh login next upload (use after password change)')
     .toJSON(),
+
+  new SlashCommandBuilder()
+    .setName('dcheck')
+    .setDescription('Find and delete duplicate channels — keeps the one with messages, deletes the rest (owner only)')
+    .addBooleanOption((o) =>
+      o.setName('dryrun')
+        .setDescription('Preview what would be deleted without actually deleting (default: false)')
+    )
+    .toJSON(),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -471,6 +480,96 @@ async function handlePipeline(interaction, actions) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// /dcheck — Delete duplicate channels, keeping the one with messages
+// ─────────────────────────────────────────────────────────────────────────────
+async function handleDcheck(interaction, client, config) {
+  const dryRun = interaction.options.getBoolean('dryrun') ?? false;
+
+  await interaction.deferReply({ ephemeral: true });
+
+  if (!config.guildId) {
+    return interaction.editReply({ content: '❌ `guildId` is not set in config — cannot scan.' });
+  }
+
+  await interaction.editReply({ content: '🔍 Scanning all channels for duplicates…' });
+
+  let guild;
+  try {
+    guild = await client.guilds.fetch(config.guildId);
+    await guild.channels.fetch();
+  } catch (err) {
+    return interaction.editReply({ content: `❌ Could not fetch guild: ${err.message}` });
+  }
+
+  // Group text channels by lowercase name
+  const byName = new Map(); // name → Channel[]
+  for (const ch of guild.channels.cache.values()) {
+    if (ch.type !== 0) continue; // text channels only
+    const key = ch.name.toLowerCase();
+    if (!byName.has(key)) byName.set(key, []);
+    byName.get(key).push(ch);
+  }
+
+  // Find groups with more than 1 channel (duplicates)
+  const dupGroups = [...byName.values()].filter(g => g.length > 1);
+
+  if (dupGroups.length === 0) {
+    return interaction.editReply({ content: '✅ **No duplicate channels found.** Everything looks clean!' });
+  }
+
+  const totalDups = dupGroups.reduce((sum, g) => sum + g.length - 1, 0);
+  await interaction.editReply({
+    content: [
+      `🔎 Found **${dupGroups.length} group(s)** of duplicate channels — **${totalDups} extra** to remove.`,
+      dryRun ? '\n⚠️ **DRY RUN** — nothing will actually be deleted.' : '\n🗑️ Deleting duplicates now…',
+    ].join(''),
+  });
+
+  let deleted = 0;
+  let failed  = 0;
+  const report = [];
+
+  for (const group of dupGroups) {
+    // Sort: prefer channel with most recent message (lastMessageId is a snowflake — higher = newer)
+    // Keep the one with the highest lastMessageId (most recently active); delete the rest
+    group.sort((a, b) => {
+      const aId = BigInt(a.lastMessageId || '0');
+      const bId = BigInt(b.lastMessageId || '0');
+      return bId > aId ? 1 : bId < aId ? -1 : 0;
+    });
+
+    const [keep, ...toDelete] = group;
+    report.push(`• **${keep.name}** — keep <#${keep.id}>, delete ${toDelete.length} duplicate(s)`);
+
+    if (!dryRun) {
+      for (const ch of toDelete) {
+        try {
+          await ch.delete('Duplicate channel — removed by /dcheck');
+          deleted++;
+          await new Promise(r => setTimeout(r, 300)); // small delay to avoid rate limit
+        } catch (err) {
+          console.warn(`[commandHandler] /dcheck failed to delete #${ch.name} (${ch.id}): ${err.message}`);
+          failed++;
+        }
+      }
+    } else {
+      deleted += toDelete.length; // count as if deleted (dry run)
+    }
+  }
+
+  const lines = [
+    dryRun
+      ? `🔍 **DRY RUN Results** — **${deleted}** channel(s) would be deleted:`
+      : `✅ **Done** — **${deleted}** duplicate(s) deleted${failed > 0 ? `, **${failed}** failed` : ''}:`,
+    '',
+    ...report.slice(0, 20), // cap at 20 lines to avoid Discord 2000-char limit
+    report.length > 20 ? `…and ${report.length - 20} more group(s)` : '',
+  ].filter(Boolean);
+
+  await interaction.editReply({ content: lines.join('\n').slice(0, 1990) });
+}
+
 async function handleInvalidateSession(interaction) {
   invalidateSession();
   return interaction.reply({
@@ -514,6 +613,7 @@ function attachCommandHandler(client, config, actions = {}) {
       if (cmd === 'mirror')             return await handleMirror(interaction, config, actions);
       if (cmd === 'pipeline')           return await handlePipeline(interaction, actions);
       if (cmd === 'invalidatesession')  return await handleInvalidateSession(interaction);
+      if (cmd === 'dcheck')              return await handleDcheck(interaction, client, config);
     } catch (err) {
       console.error(`[commandHandler] Unhandled error in /${cmd}: ${err.message}`);
       const payload = { ephemeral: true, content: `❌ An unexpected error occurred: ${err.message}` };

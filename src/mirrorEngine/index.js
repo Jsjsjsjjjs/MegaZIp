@@ -191,24 +191,6 @@ async function processLink(entry, config) {
   const tmpDir = path.join(TEMP_DIR, crypto.randomBytes(8).toString('hex'));
   fs.mkdirSync(tmpDir, { recursive: true });
 
-  // ── 0. Discord deduplication check (survives state loss) ─────────────────
-  // If the target guild already has a channel with this file's name, the file
-  // was already delivered — skip the entire download/encrypt/upload pipeline.
-  // Channel name is the ground truth: it only exists if the bot created it.
-  try {
-    const { buildChannelName } = require('../unicodeFormatter');
-    const expectedChName = buildChannelName(name, config).toLowerCase();
-
-    if (_guildChannelNames !== null && _guildChannelNames.has(expectedChName)) {
-      setEntry(link, { status: 'done', error: null });
-      console.log(`[mirrorEngine] ⏭ Skip (channel exists): ${name}`);
-      safeDelete(tmpDir);
-      return;
-    }
-  } catch (preCheckErr) {
-    console.warn(`[mirrorEngine] Pre-check warning for "${name}": ${preCheckErr.message}`);
-  }
-
   try {
 
     // ── 1. Download ────────────────────────────────────────────────────────
@@ -233,6 +215,21 @@ async function processLink(entry, config) {
 
     const remoteExt = remoteName ? path.extname(remoteName).toLowerCase() : '';
     const isZip     = remoteExt === '.zip';
+
+    // ── 1.5. Discord dedup check using actual baseName ────────────────────
+    // Now that we know the real baseName (from MEGA), check if the target guild
+    // already has a channel with this exact name. If yes, the file was already
+    // delivered — skip the expensive encrypt/upload/post steps.
+    {
+      const { buildChannelName } = require('../unicodeFormatter');
+      const expectedChName = buildChannelName(baseName, config).toLowerCase();
+      if (_guildChannelNames && _guildChannelNames.has(expectedChName)) {
+        setEntry(link, { status: 'done', error: null });
+        console.log(`[mirrorEngine] ⏭ Already delivered: ${baseName}`);
+        safeDelete(tmpDir);
+        return;
+      }
+    }
 
     // Rename download.bin to its real extension so 7zip can detect format
     const renamedPath = path.join(tmpDir, remoteName || `${baseName}${remoteExt || '.bin'}`);
