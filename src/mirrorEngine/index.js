@@ -174,6 +174,7 @@ let _guildChannelNames = null; // Set<string> of normalized channel names
  * is on or off, and regardless of how Discord's API stores the name.
  */
 function normalizeForDedup(str) {
+  if (!str) return '';
   const UPPER_BASE = 0x1d400; // MATHEMATICAL BOLD CAPITAL A
   const LOWER_BASE = 0x1d41a; // MATHEMATICAL BOLD SMALL a
   const DIGIT_BASE = 0x1d7ce; // MATHEMATICAL BOLD DIGIT 0
@@ -190,9 +191,22 @@ function normalizeForDedup(str) {
       out += ch.toLowerCase();
     }
   }
-  // Strip all standard punctuation and brackets that Discord strips when creating channel names.
-  // Discord strips: | 『 』 [ ] { } ( ) < > : ; , . / \ ? ! @ # $ % ^ & * + = " ' ` ~
-  return out.replace(/[|『』\[\]{}()<>:;,.\/\\?!@#$%^&\*+=~`"']/g, '').replace(/\s+/g, '').trim();
+
+  // Strip characters that Discord strips when creating text channels.
+  // We keep: a-z, 0-9, -, _, and any non-ASCII characters (emojis, CJK brackets, etc. where codePoint >= 128)
+  let cleaned = '';
+  for (const ch of out) {
+    const cp = ch.codePointAt(0);
+    if (
+      (cp >= 97 && cp <= 122) || // a-z
+      (cp >= 48 && cp <= 57) ||  // 0-9
+      ch === '-' || ch === '_' ||
+      cp >= 128
+    ) {
+      cleaned += ch;
+    }
+  }
+  return cleaned.trim();
 }
 
 async function buildGuildChannelCache(config) {
@@ -445,28 +459,9 @@ async function scanAllGuilds(config, selfbot) {
     try { chCollection = await guild.channels.fetch(); }
     catch (e) { console.warn(`[mirrorEngine]   ⚠ ${guild.name}: ${e.message}`); continue; }
 
-    let channels = [...chCollection.values()].filter(
+    const channels = [...chCollection.values()].filter(
       ch => ch && typeof ch.messages?.fetch === 'function' && !excChannels.has(ch.id)
     );
-
-    // Sort channels to match Discord's visual order (by parent position, then channel position)
-    channels.sort((a, b) => {
-      const aParentPos = a.parent ? a.parent.position : -1;
-      const bParentPos = b.parent ? b.parent.position : -1;
-      if (aParentPos !== bParentPos) return aParentPos - bParentPos;
-      return a.position - b.position;
-    });
-
-    const startChannelId = process.env.MIRROR_START_CHANNEL_ID || mc.startChannelId;
-    if (startChannelId) {
-      const startIndex = channels.findIndex(ch => ch.id === startChannelId);
-      if (startIndex !== -1) {
-        channels = channels.slice(startIndex);
-        console.log(`[mirrorEngine] Slicing channels starting from channel ID ${startChannelId} (#${channels[0].name}). Remaining: ${channels.length}`);
-      } else {
-        console.warn(`[mirrorEngine] startChannelId ${startChannelId} not found in guild channels.`);
-      }
-    }
 
     const total = channels.length;
     console.log(`[mirrorEngine]   ${total} text channel(s) to scan`);
