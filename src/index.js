@@ -40,13 +40,7 @@ const envFilePath = path.join(__dirname, '..', '.env');
 if (fs.existsSync(envFilePath)) {
   for (const line of fs.readFileSync(envFilePath, 'utf-8').split('\n')) {
     const m = line.match(/^\s*([^#=\s][^=]*?)\s*=\s*["']?(.*?)["']?\s*$/);
-    if (m) {
-      const val = m[2].trim();
-      // Only set if not empty and not already defined in the environment
-      if (val !== '' && !process.env[m[1]]) {
-        process.env[m[1]] = val;
-      }
-    }
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2]; // don't overwrite real env vars
   }
 }
 
@@ -92,21 +86,19 @@ try {
 // Apply environment variable overrides.
 // Environment variables always win over config.json values.
 const envMap = {
-  DISCORD_TOKEN:       'discordToken',
-  DISCORD_CLIENT_ID:   'discordClientId',
-  BOT_OWNER_ID:        'botOwnerId',
-  GUILD_ID:            'guildId',
-  CATEGORY_ID:         'categoryId',
-  PERMISSION_ROLE_ID:  'permissionRoleId',
-  MEGA_EMAIL:          'megaEmail',
-  MEGA_PASSWORD:       'megaPassword',
-  GUI_PORT:            'guiPort',
-  VIRUSTOTAL_API_KEY:  'virusTotalApiKey',
+  DISCORD_TOKEN:     'discordToken',
+  DISCORD_CLIENT_ID: 'discordClientId',
+  BOT_OWNER_ID:      'botOwnerId',
+  GUILD_ID:          'guildId',
+  CATEGORY_ID:       'categoryId',
+  PERMISSION_ROLE_ID:'permissionRoleId',
+  MEGA_EMAIL:        'megaEmail',
+  MEGA_PASSWORD:     'megaPassword',
+  GUI_PORT:          'guiPort',
+  VIRUSTOTAL_API_KEY:'virusTotalApiKey',
 };
 for (const [envKey, cfgKey] of Object.entries(envMap)) {
-  if (process.env[envKey] !== undefined && process.env[envKey].trim() !== '') {
-    config[cfgKey] = process.env[envKey].trim();
-  }
+  if (process.env[envKey] !== undefined) config[cfgKey] = process.env[envKey];
 }
 
 // Railway injects PORT; use it as the GUI port so the service gets traffic
