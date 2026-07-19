@@ -47,6 +47,7 @@
     "sourceGuildIds": [],
     "excludeGuildIds": [],
     "excludeChannelIds": [],
+    "startChannelId": "1528254322456924420",
     "concurrency": 2,
     "channelTimeoutMs": 30000,
     "downloadTimeoutMs": 300000

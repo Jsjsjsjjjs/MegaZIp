@@ -486,13 +486,11 @@ async function handlePipeline(interaction, actions) {
 async function handleDcheck(interaction, client, config) {
   const dryRun = interaction.options.getBoolean('dryrun') ?? false;
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.reply({ ephemeral: true, content: '🔍 Duplicate channel cleanup started. Scanning server channels…' });
 
   if (!config.guildId) {
     return interaction.editReply({ content: '❌ `guildId` is not set in config — cannot scan.' });
   }
-
-  await interaction.editReply({ content: '🔍 Scanning all channels for duplicates…' });
 
   let guild;
   try {
