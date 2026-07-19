@@ -1,5 +1,7 @@
 node_modules/
 state.json
+mirror-state.json
+mega-session.json
 watched-folder/*.zip
 watched-folder/encrypted/
 config/config.json.bak

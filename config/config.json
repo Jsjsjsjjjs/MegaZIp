@@ -7,6 +7,7 @@
   "permissionRoleId": "SET_VIA_RAILWAY_ENV",
   "megaEmail": "SET_VIA_RAILWAY_ENV",
   "megaPassword": "SET_VIA_RAILWAY_ENV",
+  "virusTotalApiKey": "SET_VIA_RAILWAY_ENV",
   "watchFolder": "./watched-folder",
   "channelNameTemplate": "\u300e\ud83c\udf90\u300f|{name}",
   "channelNameBoldStyle": true,

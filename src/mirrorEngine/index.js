@@ -99,7 +99,22 @@ function linkKey(url) {
 //   pending → downloading → encrypting → uploading → channel_created → done
 //   any step can also transition to: failed
 
-let _state = {}; // { [linkKey]: LinkEntry }
+let _state   = {}; // { [linkKey]: LinkEntry }
+let _started = false;
+let _selfbot = null;
+
+// ─── Live engine status (for /mirror status command) ─────────────────────────
+const _engineStatus = {
+  running:    false,
+  phase:      null,
+  done:       0,
+  total:      0,
+  lastRunAt:  null,
+};
+
+function getMirrorEngineStatus() {
+  return { ..._engineStatus };
+}
 
 function loadState() {
   try {
@@ -422,26 +437,11 @@ async function runWithConcurrency(items, concurrency, fn) {
 
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
-let _selfbot = null;
-let _started = false;
 
-function getMirrorEngineStatus() {
-  const counts = Object.values(_state).reduce((a, v) => { a[v.status] = (a[v.status]||0)+1; return a; }, {});
-  return {
-    started: _started,
-    stateCounts: counts
-  };
-}
-
-/**
- * Starts the mirror engine.
- * @param {object} config
- * @param {boolean} [force=false] - Bypass mc.enabled config check
- */
-async function startMirrorEngine(config, force = false) {
+function startMirrorEngine(config) {
   const mc = config.mirrorEngine;
 
-  if (!force && !mc?.enabled) {
+  if (!mc?.enabled) {
     console.log('[mirrorEngine] Disabled — skipping.');
     return;
   }
@@ -476,10 +476,9 @@ async function startMirrorEngine(config, force = false) {
   }
   if (resetCount) { saveState(); console.log(`[mirrorEngine] Reset ${resetCount} stale entry(ies).`); }
 
-  // Clear mirror state database to start mirroring from the beginning on every run
-  _state = {};
-  saveState();
-  console.log('[mirrorEngine] Cleared links state database to start fresh.');
+  // State summary
+  const counts = Object.values(_state).reduce((a, v) => { a[v.status] = (a[v.status]||0)+1; return a; }, {});
+  if (Object.keys(counts).length) console.log('[mirrorEngine] Loaded state:', JSON.stringify(counts));
 
   // downloadManager.init() is called by index.js before startMirrorEngine.
   // Do NOT call it again here — it would reset shared download state.
@@ -515,7 +514,11 @@ async function runEngine(config) {
   const mc          = config.mirrorEngine;
   const concurrency = Math.max(1, mc.concurrency || 2);
 
-  // ── Phase 1: Scan ────────────────────────────────────────────────────────
+  _engineStatus.running   = true;
+  _engineStatus.lastRunAt = new Date().toISOString();
+
+  // ── Phase 1: Scan ────────────────────────────────────────────────────
+  _engineStatus.phase = 'Scanning';
   console.log('[mirrorEngine] ── Phase 1: Scanning for MEGA links...');
   const found = await scanAllGuilds(config, _selfbot);
 
@@ -550,6 +553,8 @@ async function runEngine(config) {
 
 function stopMirrorEngine() {
   _started = false;
+  _engineStatus.running = false;
+  _engineStatus.phase   = null;
   if (_selfbot) { _selfbot.destroy(); _selfbot = null; }
 }
 

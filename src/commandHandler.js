@@ -1,526 +1,528 @@
+'use strict';
+
 const { REST, Routes, SlashCommandBuilder, ChannelType } = require('discord.js');
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
-const { getAllStates, getLogs } = require('./stateStore');
-const { editZipMessage } = require('./webhookSender');
-const { getFileSha256, getFileReport, scanUrl } = require('./virusTotal');
+const os   = require('os');
+
+const { getAllStates }                   = require('./stateStore');
+const { editZipMessage }                 = require('./webhookSender');
+const { extractMegaLinks, flattenEmbed } = require('./downloadEngine/linkExtractor');
+const { downloadMegaFile }               = require('./downloadEngine/downloadManager');
+const { scanFile }                       = require('./vtScanner');
 
 const configPath = path.join(__dirname, '..', 'config', 'config.json');
 
-/**
- * Registers all slash commands for a single guild.
- */
-async function registerCommands(config) {
-  const token = config.discordToken;
-  const clientId = config.discordClientId;
-  const guildId = config.guildId;
+// ── Unicode bold → ASCII normaliser (for /dcheck) ────────────────────────────
+const BOLD_UNICODE_MAP = {
+  '𝗔':'A','𝗕':'B','𝗖':'C','𝗗':'D','𝗘':'E','𝗙':'F','𝗚':'G','𝗛':'H','𝗜':'I','𝗝':'J',
+  '𝗞':'K','𝗟':'L','𝗠':'M','𝗡':'N','𝗢':'O','𝗣':'P','𝗤':'Q','𝗥':'R','𝗦':'S','𝗧':'T',
+  '𝗨':'U','𝗩':'V','𝗪':'W','𝗫':'X','𝗬':'Y','𝗭':'Z',
+  '𝗮':'a','𝗯':'b','𝗰':'c','𝗱':'d','𝗲':'e','𝗳':'f','𝗴':'g','𝗵':'h','𝗶':'i','𝗷':'j',
+  '𝗸':'k','𝗹':'l','𝗺':'m','𝗻':'n','𝗼':'o','𝗽':'p','𝗾':'q','𝗿':'r','𝘀':'s','𝘁':'t',
+  '𝘂':'u','𝘃':'v','𝘄':'w','𝘅':'x','𝘆':'y','𝘇':'z',
+  '𝟬':'0','𝟭':'1','𝟮':'2','𝟯':'3','𝟰':'4','𝟱':'5','𝟲':'6','𝟳':'7','𝟴':'8','𝟵':'9',
+  // Italic bold
+  '𝘼':'A','𝘽':'B','𝘾':'C','𝘿':'D','𝙀':'E','𝙁':'F','𝙂':'G','𝙃':'H','𝙄':'I','𝙅':'J',
+  '𝙆':'K','𝙇':'L','𝙈':'M','𝙉':'N','𝙊':'O','𝙋':'P','𝙌':'Q','𝙍':'R','𝙎':'S','𝙏':'T',
+  '𝙐':'U','𝙑':'V','𝙒':'W','𝙓':'X','𝙔':'Y','𝙕':'Z',
+};
 
-  if (!clientId || clientId === 'SET_VIA_RAILWAY_ENV' || clientId.includes('YOUR_') ||
-      !token || token === 'SET_VIA_RAILWAY_ENV' || token.includes('YOUR_') ||
-      !guildId || guildId === 'SET_VIA_RAILWAY_ENV' || guildId.includes('YOUR_')) {
-    console.warn('[commandHandler] Skipping slash command registration — placeholder or missing client ID, token, or guild ID.');
-    return;
+function normalizeChannelName(name) {
+  if (!name) return '';
+  // Replace bold unicode chars
+  let out = '';
+  for (const ch of name) out += BOLD_UNICODE_MAP[ch] || ch;
+  // Strip Discord-illegal chars, collapse whitespace, lowercase
+  return out.replace(/[^\w\s\-\.]/g, '').replace(/\s+/g, '-').toLowerCase().trim();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+async function isOwner(interaction, config) {
+  return !config.botOwnerId || interaction.user.id === config.botOwnerId;
+}
+
+async function ownerOnly(interaction, config) {
+  if (!(await isOwner(interaction, config))) {
+    await interaction.reply({ content: '🚫 Only the bot owner can use this command.', ephemeral: true });
+    return false;
+  }
+  return true;
+}
+
+// ── Command definitions ───────────────────────────────────────────────────────
+async function registerCommands(config) {
+  if (!config.discordClientId) {
+    throw new Error('discordClientId missing in config (needed for slash commands)');
   }
 
   const commands = [
+    // ── Status ────────────────────────────────────────────────────────────────
+    new SlashCommandBuilder()
+      .setName('status')
+      .setDescription('Pipeline + mirror engine status (owner only)')
+      .toJSON(),
+
+    // ── Set template ──────────────────────────────────────────────────────────
     new SlashCommandBuilder()
       .setName('settemplate')
       .setDescription('Update the plain-text message template (owner only)')
-      .addStringOption((o) =>
-        o.setName('template').setDescription('Use {name}, {link}, {password}.').setRequired(true)
-      )
+      .addStringOption(o => o.setName('template').setDescription('Use {name},{link},{password}').setRequired(true))
       .toJSON(),
 
+    // ── Toggle embed ──────────────────────────────────────────────────────────
     new SlashCommandBuilder()
       .setName('toggleembed')
-      .setDescription('Toggle between plain-text and rich embed message mode (owner only)')
+      .setDescription('Toggle plain-text ↔ rich embed mode (owner only)')
       .toJSON(),
 
+    // ── Update posts ──────────────────────────────────────────────────────────
     new SlashCommandBuilder()
       .setName('updateposts')
-      .setDescription('Re-render all posted webhook messages with the current template (owner only)')
+      .setDescription('Re-render all posted messages with current template (owner only)')
       .toJSON(),
 
-    new SlashCommandBuilder()
-      .setName('status')
-      .setDescription('Get a summary of the current pipeline state (owner only)')
-      .toJSON(),
-
+    // ── /check — VirusTotal scan (whole server or specific channel) ─────────────
     new SlashCommandBuilder()
       .setName('check')
-      .setDescription('Scan/check a file or channel link via VirusTotal (owner only)')
-      .addChannelOption((o) =>
-        o.setName('channel').setDescription('Channel containing the MEGA link to scan').addChannelTypes(ChannelType.GuildText)
-      )
-      .addStringOption((o) =>
-        o.setName('link').setDescription('Direct MEGA link to check')
+      .setDescription('Scan MEGA links via VirusTotal — whole server or a specific channel (owner only)')
+      .addStringOption(o =>
+        o.setName('channel')
+          .setDescription('Channel name, ID, or Discord link (leave blank for whole server)')
+          .setRequired(false)
       )
       .toJSON(),
 
+    // ── /regenerate ───────────────────────────────────────────────────────────
     new SlashCommandBuilder()
       .setName('regenerate')
-      .setDescription('Re-download, decrypt, re-encrypt and upload to get a new MEGA link (owner only)')
-      .addChannelOption((o) =>
-        o.setName('channel').setDescription('Target channel to regenerate and update').setRequired(true).addChannelTypes(ChannelType.GuildText)
-      )
-      .toJSON(),
-
-    new SlashCommandBuilder()
-      .setName('mirror')
-      .setDescription('Control the mirror engine (owner only)')
-      .addStringOption((o) =>
-        o.setName('action')
-          .setDescription('Action to perform')
+      .setDescription('Re-upload a file to MEGA and update its channel message (owner only)')
+      .addStringOption(o =>
+        o.setName('channel')
+          .setDescription('Channel name or ID')
           .setRequired(true)
-          .addChoices(
-            { name: 'Start Scanning & Mirroring', value: 'start' },
-            { name: 'Stop Mirror Engine', value: 'stop' },
-            { name: 'Get Engine Status', value: 'status' }
-          )
       )
       .toJSON(),
 
-    new SlashCommandBuilder()
-      .setName('pipeline')
-      .setDescription('Control the active download/upload pipeline (owner only)')
-      .addStringOption((o) =>
-        o.setName('action')
-          .setDescription('Action to perform')
-          .setRequired(true)
-          .addChoices(
-            { name: 'Pause Queue', value: 'pause' },
-            { name: 'Resume Queue', value: 'resume' },
-            { name: 'Cancel Pending Jobs', value: 'cancel' }
-          )
-      )
-      .toJSON(),
-
+    // ── /dcheck — Deduplication across whole server ───────────────────────────
     new SlashCommandBuilder()
       .setName('dcheck')
-      .setDescription('Delete duplicate text channels in the server by normalizing bold names to ASCII (owner only)')
-      .addBooleanOption((o) =>
-        o.setName('dryrun').setDescription('Only list the duplicate channels without deleting them (default: false)')
+      .setDescription('Find & delete duplicate channels across the server (owner only)')
+      .addBooleanOption(o =>
+        o.setName('dryrun')
+          .setDescription('true = only list duplicates, do not delete')
+          .setRequired(false)
+      )
+      .toJSON(),
+
+    // ── /mirror — Mirror engine control ───────────────────────────────────────
+    new SlashCommandBuilder()
+      .setName('mirror')
+      .setDescription('Mirror engine controls (owner only)')
+      .addStringOption(o =>
+        o.setName('action')
+          .setDescription('Action to perform')
+          .setRequired(true)
+          .addChoices(
+            { name: 'status', value: 'status' },
+            { name: 'start',  value: 'start'  },
+            { name: 'stop',   value: 'stop'   },
+          )
+      )
+      .toJSON(),
+
+    // ── /pipeline — Pipeline control ──────────────────────────────────────────
+    new SlashCommandBuilder()
+      .setName('pipeline')
+      .setDescription('Upload pipeline controls (owner only)')
+      .addStringOption(o =>
+        o.setName('action')
+          .setDescription('Action to perform')
+          .setRequired(true)
+          .addChoices(
+            { name: 'status', value: 'status' },
+            { name: 'pause',  value: 'pause'  },
+            { name: 'resume', value: 'resume' },
+          )
       )
       .toJSON(),
   ];
 
   const rest = new REST({ version: '10' }).setToken(config.discordToken);
-  await rest.put(Routes.applicationGuildCommands(config.discordClientId, config.guildId), {
-    body: commands,
-  });
+  await rest.put(
+    Routes.applicationGuildCommands(config.discordClientId, config.guildId),
+    { body: commands }
+  );
 }
 
-/**
- * Wires up the interactionCreate listener for all slash commands.
- */
-/**
- * Wires up the interactionCreate listener for all slash commands.
- */
-function attachCommandHandler(client, config, actions = {}) {
+// ── Command handler ───────────────────────────────────────────────────────────
+function attachCommandHandler(client, config, {
+  mirrorControls = {},   // { getStatus, start, stop }
+  pipelineControls = {}, // { pause, resume, getStatus }
+  onIngestLink,
+} = {}) {
+
   client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
     // All commands are owner-only
-    if (config.botOwnerId && interaction.user.id !== config.botOwnerId) {
-      await interaction.reply({ content: '🚫 Only the bot owner can use this command.', ephemeral: true });
-      return;
-    }
+    if (!(await ownerOnly(interaction, config))) return;
 
-    // ── /settemplate ─────────────────────────────────────────────────────────
-    if (interaction.commandName === 'settemplate') {
-      const newTemplate = interaction.options.getString('template', true);
-      config.messageTemplate = newTemplate;
-      fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-
-      const warning = !newTemplate.includes('{link}')
-        ? '\n⚠️ No `{link}` placeholder — the MEGA link won\'t appear in messages.'
-        : '';
-
-      await interaction.reply({
-        content: `✅ Plain-text template updated:\n\`\`\`${newTemplate}\`\`\`${warning}`,
-        ephemeral: true,
-      });
-      return;
-    }
-
-    // ── /toggleembed ─────────────────────────────────────────────────────────
-    if (interaction.commandName === 'toggleembed') {
-      if (!config.advancedTemplate) config.advancedTemplate = { useEmbed: false };
-      config.advancedTemplate.useEmbed = !config.advancedTemplate.useEmbed;
-      fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-
-      const mode = config.advancedTemplate.useEmbed ? '🖼️ Embed' : '📝 Plain text';
-      await interaction.reply({
-        content: `✅ Message mode switched to **${mode}**. New deliveries will use this format.\nRun \`/updateposts\` to update already-posted messages.`,
-        ephemeral: true,
-      });
-      return;
-    }
+    const cmd = interaction.commandName;
 
     // ── /status ───────────────────────────────────────────────────────────────
-    if (interaction.commandName === 'status') {
-      const states = getAllStates() || {};
+    if (cmd === 'status') {
+      const states  = getAllStates() || {};
       const entries = Object.values(states);
-      const counts = { pending: 0, encrypting: 0, uploading: 0, uploaded: 0, channel_created: 0, message_sent: 0, failed: 0 };
+      const counts  = { pending:0, encrypting:0, uploading:0, uploaded:0, channel_created:0, message_sent:0, failed:0 };
       for (const s of entries) { if (s.status in counts) counts[s.status]++; }
 
-      const logs = getLogs();
+      const mirrorStatus = mirrorControls.getStatus?.() || { running: false };
+
       const lines = [
-        `📊 **Pipeline Status** (${entries.length} total files)`,
-        `✅ Completed: **${counts.message_sent}**`,
-        `⬆️ Uploading: **${counts.uploading + counts.uploaded + counts.channel_created + counts.encrypting}**`,
-        `❌ Failed: **${counts.failed}**`,
-        `📋 Total logs: **${logs.length}**`,
+        '📊 **Pipeline Status**',
+        `✅ Completed : **${counts.message_sent}**`,
+        `⬆️  In-flight : **${counts.uploading + counts.uploaded + counts.channel_created + counts.encrypting}**`,
+        `❌ Failed    : **${counts.failed}**`,
+        `📋 Total     : **${entries.length}**`,
         `🖼️ Embed mode: **${config.advancedTemplate?.useEmbed ? 'ON' : 'OFF'}**`,
-      ];
+        '',
+        '🔁 **Mirror Engine**',
+        `Status : **${mirrorStatus.running ? '🟢 Running' : '⚫ Idle'}**`,
+        mirrorStatus.phase  ? `Phase  : **${mirrorStatus.phase}**` : '',
+        mirrorStatus.done   != null ? `Done   : **${mirrorStatus.done}** / **${mirrorStatus.total}**` : '',
+        mirrorStatus.lastRunAt ? `Last run: ${mirrorStatus.lastRunAt}` : '',
+      ].filter(Boolean);
 
       await interaction.reply({ content: lines.join('\n'), ephemeral: true });
       return;
     }
 
-    // ── /updateposts ─────────────────────────────────────────────────────────
-    if (interaction.commandName === 'updateposts') {
-      await interaction.deferReply({ ephemeral: true });
+    // ── /settemplate ──────────────────────────────────────────────────────────
+    if (cmd === 'settemplate') {
+      const tpl = interaction.options.getString('template', true);
+      config.messageTemplate = tpl;
+      try { fs.writeFileSync(configPath, JSON.stringify(config, null, 2)); } catch {}
+      const warn = !tpl.includes('{link}') ? '\n⚠️ No `{link}` — the MEGA link won\'t appear in messages.' : '';
+      await interaction.reply({ content: `✅ Template updated:\n\`\`\`${tpl}\`\`\`${warn}`, ephemeral: true });
+      return;
+    }
 
+    // ── /toggleembed ──────────────────────────────────────────────────────────
+    if (cmd === 'toggleembed') {
+      if (!config.advancedTemplate) config.advancedTemplate = { useEmbed: false };
+      config.advancedTemplate.useEmbed = !config.advancedTemplate.useEmbed;
+      try { fs.writeFileSync(configPath, JSON.stringify(config, null, 2)); } catch {}
+      const mode = config.advancedTemplate.useEmbed ? '🖼️ Embed' : '📝 Plain text';
+      await interaction.reply({ content: `✅ Switched to **${mode}** mode.`, ephemeral: true });
+      return;
+    }
+
+    // ── /updateposts ──────────────────────────────────────────────────────────
+    if (cmd === 'updateposts') {
+      await interaction.deferReply({ ephemeral: true });
       const states = getAllStates() || {};
-      let updated = 0;
-      let skipped = 0;
-      let failed = 0;
+      let updated = 0, skipped = 0, failed = 0;
 
       for (const [filename, state] of Object.entries(states)) {
-        if (state.status !== 'message_sent' || !state.channelId || !state.messageId) {
-          skipped++;
-          continue;
-        }
-
+        if (state.status !== 'message_sent' || !state.channelId || !state.messageId) { skipped++; continue; }
         try {
-          const channel = await client.channels.fetch(state.channelId);
-          if (!channel) { skipped++; continue; }
-
+          const ch = await client.channels.fetch(state.channelId);
+          if (!ch) { skipped++; continue; }
           const baseName = path.basename(filename, path.extname(filename));
-          await editZipMessage(channel, state.messageId, {
-            name: baseName,
-            link: state.megaLink || '',
-            password: state.zipPassword || '',
-          }, config);
+          await editZipMessage(ch, state.messageId, { name: baseName, link: state.megaLink || '', password: state.zipPassword || '' }, config);
           updated++;
-        } catch (err) {
-          console.warn(`[commandHandler] /updateposts failed for "${filename}": ${err.message}`);
-          failed++;
-        }
+        } catch { failed++; }
       }
-
-      // Also scan all channels in the bot's category for any posts not in state
-      if (config.guildId && config.categoryId) {
-        try {
-          const guild = await client.guilds.fetch(config.guildId);
-          const channels = [...guild.channels.cache.values()].filter(
-            (ch) => ch.parentId === config.categoryId
-          );
-
-          for (const ch of channels) {
-            try {
-              const webhooks = await ch.fetchWebhooks();
-              const ourWebhook = webhooks.find((wh) => wh.name === 'ZipBot Delivery');
-              if (!ourWebhook) continue;
-
-              const messages = await ch.messages.fetch({ limit: 10 });
-              for (const msg of messages.values()) {
-                if (msg.webhookId !== ourWebhook.id) continue;
-                // Check if this message is already tracked (skip if so)
-                const trackedEntry = Object.values(states).find((s) => s.messageId === msg.id);
-                if (trackedEntry) continue;
-
-                // Parse name/link/password from existing content
-                const content = msg.content || (msg.embeds[0]?.title ?? '');
-                // Best-effort parse from plain text
-                const linkMatch = content.match(/https?:\/\/mega\.nz\/[^\s]+/);
-                const pwMatch = content.match(/(?:Password|pass)[:\-\s]+([^\s\n]+)/i);
-                const nameMatch = content.match(/\*\*(.+?)\*\*/);
-
-                if (!linkMatch) continue;
-                await editZipMessage(ch, msg.id, {
-                  name: nameMatch ? nameMatch[1] : ch.name,
-                  link: linkMatch[0],
-                  password: pwMatch ? pwMatch[1] : '',
-                }, config);
-                updated++;
-              }
-            } catch { /* skip channels we can't access */ }
-          }
-        } catch (err) {
-          console.warn(`[commandHandler] /updateposts category scan failed: ${err.message}`);
-        }
-      }
-
-      await interaction.editReply({
-        content: `✅ Done!\n• Updated: **${updated}** messages\n• Skipped (no messageId): **${skipped}**\n• Errors: **${failed}**`,
-      });
+      await interaction.editReply({ content: `✅ Done! Updated: **${updated}** | Skipped: **${skipped}** | Errors: **${failed}**` });
       return;
     }
 
-    // ── /pipeline ────────────────────────────────────────────────────────────
-    if (interaction.commandName === 'pipeline') {
+    // ── /mirror ───────────────────────────────────────────────────────────────
+    if (cmd === 'mirror') {
       const action = interaction.options.getString('action', true);
-      if (action === 'pause') {
-        if (typeof actions.pauseDownloads === 'function') actions.pauseDownloads();
-        await interaction.reply({ content: '⏸️ Pipeline downloads paused.', ephemeral: true });
-      } else if (action === 'resume') {
-        if (typeof actions.resumeDownloads === 'function') actions.resumeDownloads();
-        await interaction.reply({ content: '▶️ Pipeline downloads resumed.', ephemeral: true });
-      } else if (action === 'cancel') {
-        if (typeof actions.cancelDownloads === 'function') actions.cancelDownloads();
-        await interaction.reply({ content: '⏹️ All active and pending download queue jobs cancelled.', ephemeral: true });
-      }
-      return;
-    }
-
-    // ── /mirror ──────────────────────────────────────────────────────────────
-    if (interaction.commandName === 'mirror') {
-      const action = interaction.options.getString('action', true);
-      if (action === 'start') {
-        await interaction.reply({ content: '🚀 Forced Mirror Engine startup initiated. Checking channels...', ephemeral: true });
-        if (typeof actions.startMirrorEngine === 'function') {
-          actions.startMirrorEngine(config, true).catch(err => {
-            console.error(`[commandHandler] Forced Mirror start error: ${err.message}`);
-          });
-        }
+      if (action === 'status') {
+        const s = mirrorControls.getStatus?.() || { running: false };
+        const lines = [
+          `🔁 **Mirror Engine**`,
+          `Status: **${s.running ? '🟢 Running' : '⚫ Idle'}**`,
+          s.phase ? `Phase : **${s.phase}**` : '',
+          s.done  != null ? `Progress: **${s.done}/${s.total}**` : '',
+          s.lastRunAt ? `Last run: ${s.lastRunAt}` : '',
+        ].filter(Boolean);
+        await interaction.reply({ content: lines.join('\n'), ephemeral: true });
+      } else if (action === 'start') {
+        if (mirrorControls.start) { mirrorControls.start(); await interaction.reply({ content: '▶️ Mirror engine starting...', ephemeral: true }); }
+        else await interaction.reply({ content: '⚠️ Mirror engine controls not available.', ephemeral: true });
       } else if (action === 'stop') {
-        if (typeof actions.stopMirrorEngine === 'function') actions.stopMirrorEngine();
-        await interaction.reply({ content: '🛑 Mirror Engine scanning stopped.', ephemeral: true });
-      } else if (action === 'status') {
-        if (typeof actions.getMirrorEngineStatus === 'function') {
-          const status = actions.getMirrorEngineStatus();
-          const counts = status.stateCounts || {};
-          const lines = [
-            `⚡ **Mirror Engine Status**`,
-            `• Running: **${status.started ? 'Active 🟢' : 'Idle 🔴'}**`,
-            `• Pending links: **${counts.pending || 0}**`,
-            `• Completed links: **${counts.done || counts.message_sent || 0}**`,
-            `• Failed links: **${counts.failed || 0}**`
-          ];
-          await interaction.reply({ content: lines.join('\n'), ephemeral: true });
-        } else {
-          await interaction.reply({ content: '⚠️ Mirror engine status handler is not available.', ephemeral: true });
-        }
+        if (mirrorControls.stop) { mirrorControls.stop(); await interaction.reply({ content: '⏹️ Mirror engine stopping...', ephemeral: true }); }
+        else await interaction.reply({ content: '⚠️ Mirror engine controls not available.', ephemeral: true });
       }
       return;
     }
 
-    // ── /regenerate ──────────────────────────────────────────────────────────
-    if (interaction.commandName === 'regenerate') {
-      const channel = interaction.options.getChannel('channel', true);
-      await interaction.deferReply({ ephemeral: true });
-      try {
-        if (typeof actions.regenerateChannel !== 'function') {
-          throw new Error('Regeneration handler is not loaded.');
-        }
-        const filename = await actions.regenerateChannel(channel.id);
-        await interaction.editReply({
-          content: `✅ Regeneration started for <#${channel.id}> (${filename}). Re-downloading and re-encrypting. The existing channel post will be updated shortly!`
-        });
-      } catch (err) {
-        await interaction.editReply({ content: `❌ Regeneration failed: ${err.message}` });
+    // ── /pipeline ─────────────────────────────────────────────────────────────
+    if (cmd === 'pipeline') {
+      const action = interaction.options.getString('action', true);
+      if (action === 'pause')  { pipelineControls.pause?.();  await interaction.reply({ content: '⏸️ Pipeline paused.', ephemeral: true }); }
+      else if (action === 'resume') { pipelineControls.resume?.(); await interaction.reply({ content: '▶️ Pipeline resumed.', ephemeral: true }); }
+      else {
+        const s = pipelineControls.getStatus?.() || {};
+        await interaction.reply({ content: `📋 **Pipeline**\nActive: **${s.active || 0}** | Queued: **${s.queued || 0}**`, ephemeral: true });
       }
       return;
     }
 
-    // ── /check ────────────────────────────────────────────────────────────────
-    if (interaction.commandName === 'check') {
-      const apiKey = process.env.VIRUSTOTAL_API_KEY || config.virusTotalApiKey;
-      if (!apiKey) {
-        await interaction.reply({
-          content: '❌ **VirusTotal API Key is not configured.** Set the `VIRUSTOTAL_API_KEY` environment variable in Railway to use this command.',
-          ephemeral: true
-        });
-        return;
-      }
-
+    // ── /dcheck — Deduplication of whole server ───────────────────────────────
+    if (cmd === 'dcheck') {
       await interaction.deferReply({ ephemeral: true });
-
-      let targetLink = interaction.options.getString('link');
-      const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
-
-      // If direct link is not provided, scan the target channel
-      if (!targetLink && targetChannel) {
-        // Try looking in local stateStore first
-        const allStates = getAllStates() || {};
-        const stateEntry = Object.values(allStates).find(s => s.channelId === targetChannel.id);
-        if (stateEntry && stateEntry.megaLink) {
-          targetLink = stateEntry.megaLink;
-        } else {
-          // Scan last 20 messages in channel for any MEGA link
-          try {
-            const msgs = await targetChannel.messages.fetch({ limit: 20 });
-            const { extractMegaLinks, flattenEmbed } = require('./downloadEngine/linkExtractor');
-            for (const msg of msgs.values()) {
-              const content = msg.content || '';
-              let links = extractMegaLinks(content);
-              if (links.length > 0) {
-                targetLink = links[0];
-                break;
-              }
-              if (Array.isArray(msg.embeds)) {
-                for (const emb of msg.embeds) {
-                  const embedText = flattenEmbed(emb);
-                  const embLinks = extractMegaLinks(embedText);
-                  if (embLinks.length > 0) {
-                    targetLink = embLinks[0];
-                    break;
-                  }
-                }
-              }
-              if (targetLink) break;
-            }
-          } catch (err) {
-            console.warn(`[commandHandler] /check failed to fetch channel history: ${err.message}`);
-          }
-        }
-      }
-
-      if (!targetLink) {
-        await interaction.editReply({ content: '❌ No MEGA file link could be found in the specified channel or options.' });
-        return;
-      }
-
-      await interaction.editReply({ content: `🔍 **URL detected:** \`${targetLink}\`\nQuerying VirusTotal reputation database...` });
+      const dryRun = interaction.options.getBoolean('dryrun') ?? false;
 
       try {
-        // Phase 1: Scan URL
-        const urlReport = await scanUrl(targetLink, apiKey);
-        const urlStats = urlReport.attributes?.last_analysis_stats || urlReport.attributes?.stats;
-        let urlResult = 'Undetected';
-        if (urlStats) {
-          const malicious = urlStats.malicious || 0;
-          const suspicious = urlStats.suspicious || 0;
-          urlResult = malicious > 0 ? `🚨 **${malicious} Engines flagged as malicious**` : '🟢 **Clean (0 flags)**';
-        }
-
-        const urlId = Buffer.from(targetLink).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-        const vtUrlLink = `https://www.virustotal.com/gui/url/${urlId}/detection`;
-
-        await interaction.editReply({
-          content: `🔍 **VirusTotal Results**\n\n**1. URL Reputation:**\n• Status: ${urlResult}\n• Scan Link: [VirusTotal Report](${vtUrlLink})\n\n*⌛ Downloading the file to compute SHA-256 for a deep payload scan. Please hold on...*`
-        });
-
-        // Phase 2: Download file to compute payload SHA256
-        const dlFolder = path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'vt-scan');
-        if (!fs.existsSync(dlFolder)) fs.mkdirSync(dlFolder, { recursive: true });
-        const tempPath = path.join(dlFolder, `${Date.now()}-vt.zip`);
-
-        const dlManager = require('./downloadEngine/downloadManager');
-        await dlManager.downloadMegaFile(targetLink, tempPath, { timeoutMs: 120000 });
-
-        const sha256 = await getFileSha256(tempPath);
-        // Delete download immediately
-        try { fs.unlinkSync(tempPath); } catch {}
-
-        // Query file report by hash
-        const fileReport = await getFileReport(sha256, apiKey);
-        let fileText = '';
-        if (fileReport) {
-          const fileStats = fileReport.attributes?.last_analysis_stats;
-          const vtFileLink = `https://www.virustotal.com/gui/file/${sha256}/detection`;
-          if (fileStats) {
-            const mal = fileStats.malicious || 0;
-            const suspicious = fileStats.suspicious || 0;
-            const harmless = fileStats.harmless || 0;
-            const statusStr = mal > 0 ? `🚨 **Malicious (${mal} detections)**` : '🟢 **Undetected / Clean**';
-            fileText = `\n**2. File Binary Scan (SHA-256: \`${sha256.slice(0, 16)}...\`):**\n• Status: ${statusStr}\n• Stats: ${harmless} safe, ${suspicious} suspicious, ${mal} malicious\n• File Scan Link: [File Analysis Report](${vtFileLink})`;
-          } else {
-            fileText = `\n**2. File Binary Scan:**\n• SHA-256: \`${sha256}\`\n• Report Link: [File Report](${vtFileLink})`;
-          }
-        } else {
-          fileText = `\n**2. File Binary Scan:**\n• SHA-256: \`${sha256}\`\n• Status: 📭 *This file hasn't been uploaded or scanned on VirusTotal yet.*`;
-        }
-
-        await interaction.editReply({
-          content: `🔍 **VirusTotal Results**\n\n**1. URL Reputation:**\n• Status: ${urlResult}\n• Scan Link: [URL Reputation Report](${vtUrlLink})${fileText}`
-        });
-
-      } catch (err) {
-        await interaction.editReply({
-          content: `🔍 **VirusTotal Results**\n\n⚠️ Error running scan: *${err.message}*`
-        });
-      }
-      return;
-    }
-
-    // ── /dcheck ──────────────────────────────────────────────────────────────
-    if (interaction.commandName === 'dcheck') {
-      const dryrun = interaction.options.getBoolean('dryrun') ?? false;
-      await interaction.deferReply({ ephemeral: true });
-
-      try {
-        const { fromStylizedBold } = require('./unicodeFormatter');
-        const guild = interaction.guild;
-        if (!guild) {
-          throw new Error('This command can only be run in a Discord server.');
-        }
-
-        // Fetch all channels
+        const guild = await client.guilds.fetch(config.guildId);
         await guild.channels.fetch();
         const textChannels = [...guild.channels.cache.values()].filter(
-          (ch) => ch.type === ChannelType.GuildText
+          ch => ch.type === ChannelType.GuildText
         );
 
-        const groups = {}; // normalizedName -> channel objects
+        // Group by normalized name
+        const groups = new Map();
         for (const ch of textChannels) {
-          const plain = fromStylizedBold(ch.name);
-          const normalized = plain.toLowerCase().replace(/^[『🎐』|\s-]+/, '').trim();
-          if (!normalized) continue; // Skip channels with empty ascii conversion
-          if (!groups[normalized]) groups[normalized] = [];
-          groups[normalized].push(ch);
+          const key = normalizeChannelName(ch.name);
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(ch);
         }
 
-        const duplicates = [];
-        const logs = [];
-
-        for (const [normalized, list] of Object.entries(groups)) {
-          if (list.length > 1) {
-            // Sort by ID ascending (oldest channel created first)
-            list.sort((a, b) => a.id.localeCompare(b.id));
-            const keep = list[0];
-            const dupes = list.slice(1);
-            for (const d of dupes) {
-              duplicates.push(d);
-              logs.push(`• Duplicate: <#${d.id}> (Bold name: \`${d.name}\` -> ASCII: \`${fromStylizedBold(d.name)}\`) | Keep: <#${keep.id}> (\`${keep.name}\`)`);
-            }
-          }
+        // Find groups with duplicates
+        // Sort by snowflake ID (string compare works because IDs are fixed-length)
+        const duplicateGroups = [...groups.values()].filter(g => g.length > 1);
+        const toDelete = [];
+        for (const group of duplicateGroups) {
+          const sorted = [...group].sort((a, b) => (a.id < b.id ? -1 : 1)); // oldest first
+          toDelete.push(...sorted.slice(1)); // keep first (oldest), delete rest
         }
 
-        if (duplicates.length === 0) {
-          await interaction.editReply({ content: '✅ No duplicate text channels found in this server.' });
+        if (toDelete.length === 0) {
+          await interaction.editReply({ content: '✅ No duplicate channels found.' });
           return;
         }
 
-        if (dryrun) {
-          const listText = logs.slice(0, 15).join('\n') + (logs.length > 15 ? `\n*...and ${logs.length - 15} more channels.*` : '');
+        if (dryRun) {
+          const lines = toDelete.slice(0, 40).map(ch => `• <#${ch.id}> \`${ch.name}\``);
+          if (toDelete.length > 40) lines.push(`…and ${toDelete.length - 40} more`);
           await interaction.editReply({
-            content: `🔍 **[DRY RUN] Found ${duplicates.length} duplicate channels:**\n\n${listText}\n\n*No channels were deleted because dryrun option was set to true.*`
+            content: `🔍 **Dry Run — ${toDelete.length} duplicate(s) would be deleted:**\n${lines.join('\n')}`,
           });
           return;
         }
 
         // Delete duplicates
-        let deletedCount = 0;
-        let failCount = 0;
-        for (const ch of duplicates) {
+        let deleted = 0, errors = 0;
+        for (const ch of toDelete) {
           try {
-            await ch.delete('Duplicate cleanup via /dcheck command');
-            deletedCount++;
-          } catch (err) {
-            console.warn(`[commandHandler] /dcheck failed to delete channel ${ch.name} (${ch.id}): ${err.message}`);
-            failCount++;
-          }
+            await ch.delete('Duplicate channel removed by /dcheck');
+            deleted++;
+            await new Promise(r => setTimeout(r, 600)); // rate-limit guard
+          } catch { errors++; }
         }
 
         await interaction.editReply({
-          content: `🧹 **Cleanup Complete!**\n• Duplicate channels found: **${duplicates.length}**\n• Successfully deleted: **${deletedCount}**\n• Failed to delete: **${failCount}**`
+          content: `🗑️ **Deduplication complete!**\n✅ Deleted: **${deleted}** | ❌ Errors: **${errors}**`,
         });
-
       } catch (err) {
-        await interaction.editReply({ content: `❌ Error running duplicate check: ${err.message}` });
+        await interaction.editReply({ content: `❌ Error: ${err.message}` });
+      }
+      return;
+    }
+
+    // ── /check — VirusTotal scan ──────────────────────────────────────────────
+    if (cmd === 'check') {
+      await interaction.deferReply({ ephemeral: true });
+      // channel option accepts: channel name, raw ID, or Discord URL like discord.com/channels/.../channelId
+      const channelRaw = (interaction.options.getString('channel') || '').trim();
+
+      if (!process.env.VIRUSTOTAL_API_KEY) {
+        await interaction.editReply({ content: '❌ `VIRUSTOTAL_API_KEY` is not set. Add it to Railway environment variables.' });
+        return;
+      }
+
+      try {
+        const guild = await client.guilds.fetch(config.guildId);
+        await guild.channels.fetch();
+
+        // Resolve target channels
+        let channels;
+        if (!channelRaw) {
+          // Whole server
+          channels = [...guild.channels.cache.values()].filter(ch => ch.type === ChannelType.GuildText);
+        } else {
+          // Extract a channel ID if a Discord URL was pasted
+          const urlIdMatch = channelRaw.match(/channels\/\d+\/(\d+)/);
+          const resolvedId = urlIdMatch ? urlIdMatch[1] : channelRaw.replace(/^<#|>$/g, '');
+
+          // Try exact ID first, then name search
+          const found = guild.channels.cache.get(resolvedId) ||
+            guild.channels.cache.find(
+              c => c.type === ChannelType.GuildText &&
+                   c.name.toLowerCase().includes(resolvedId.toLowerCase())
+            );
+
+          if (!found) {
+            await interaction.editReply({ content: `❌ Channel \"${channelRaw}\" not found.` });
+            return;
+          }
+          channels = [found];
+        }
+
+        // Collect all unique MEGA links
+        const linkMap = new Map(); // link → { channelName, messageId }
+        const scopeLabel = channels.length === 1 ? `<#${channels[0].id}>` : `**${channels.length}** channels`;
+        await interaction.editReply({ content: `🔍 Scanning ${scopeLabel} for MEGA links...` });
+
+        for (const ch of channels) {
+          try {
+            const msgs = await ch.messages.fetch({ limit: 50 });
+            for (const msg of msgs.values()) {
+              const texts = [msg.content || ''];
+              for (const e of msg.embeds || []) texts.push(flattenEmbed(e));
+              for (const text of texts) {
+                for (const link of extractMegaLinks(text)) {
+                  if (!linkMap.has(link)) linkMap.set(link, { channelName: ch.name, messageId: msg.id });
+                }
+              }
+            }
+          } catch { /* skip inaccessible */ }
+        }
+
+        if (linkMap.size === 0) {
+          await interaction.editReply({ content: `⚠️ No MEGA links found in ${scopeLabel}.` });
+          return;
+        }
+
+        await interaction.editReply({ content: `🦠 Found **${linkMap.size}** unique MEGA link(s). Scanning via VirusTotal...` });
+
+        const results = [];
+        let processed = 0;
+
+        for (const [link, meta] of linkMap) {
+          try {
+            const tmpFile = path.join(os.tmpdir(), `vt-${Date.now()}-${processed}.bin`);
+            try {
+              await downloadMegaFile(link, tmpFile, { timeoutMs: 120_000 });
+            } catch (dlErr) {
+              results.push({ link, channel: meta.channelName, error: `Download: ${dlErr.message}` });
+              processed++;
+              continue;
+            }
+
+            let vtResult = null;
+            try {
+              vtResult = await scanFile(tmpFile);
+            } catch (vtErr) {
+              results.push({ link, channel: meta.channelName, error: `VT: ${vtErr.message}` });
+            } finally {
+              try { fs.unlinkSync(tmpFile); } catch {}
+            }
+
+            if (vtResult) results.push({ link, channel: meta.channelName, ...vtResult });
+            processed++;
+
+            if (processed % 3 === 0) {
+              await interaction.editReply({ content: `🦠 Scanned **${processed}/${linkMap.size}**...` }).catch(() => {});
+            }
+          } catch (err) {
+            results.push({ link, channel: meta.channelName, error: err.message });
+            processed++;
+          }
+        }
+
+        // Format results
+        const clean   = results.filter(r => !r.error && r.malicious === 0 && r.suspicious === 0);
+        const flagged = results.filter(r => !r.error && (r.malicious > 0 || r.suspicious > 0));
+        const errored = results.filter(r => r.error);
+
+        const summary = [
+          `✅ **${clean.length}** clean`,
+          `🚨 **${flagged.length}** flagged`,
+          `⚠️ **${errored.length}** errors`,
+        ].join(' | ');
+
+        const lines = [`🦠 **VirusTotal Scan Complete** — ${summary}\n`];
+
+        for (const r of flagged) {
+          lines.push(`🚨 **#${r.channel}** — ${r.malicious} malicious, ${r.suspicious} suspicious / ${r.total}`);
+          lines.push(`   🔗 [View Report](${r.analysisUrl})`);
+        }
+        for (const r of errored.slice(0, 5)) {
+          lines.push(`⚠️ **#${r.channel}**: ${r.error}`);
+        }
+        if (flagged.length === 0 && clean.length > 0) lines.push('\n✅ All scanned files are clean!');
+
+        await interaction.editReply({ content: lines.join('\n').slice(0, 1900) });
+      } catch (err) {
+        await interaction.editReply({ content: `❌ Error: ${err.message}` });
+      }
+      return;
+    }
+
+    // ── /regenerate ───────────────────────────────────────────────────────────
+    if (cmd === 'regenerate') {
+      await interaction.deferReply({ ephemeral: true });
+      const channelQuery = interaction.options.getString('channel', true);
+
+      try {
+        const guild = await client.guilds.fetch(config.guildId);
+        await guild.channels.fetch();
+
+        // Find the channel
+        const ch = guild.channels.cache.find(
+          c => c.type === ChannelType.GuildText &&
+               (c.id === channelQuery || c.name.toLowerCase().includes(channelQuery.toLowerCase()))
+        );
+        if (!ch) {
+          await interaction.editReply({ content: `❌ Channel "${channelQuery}" not found.` });
+          return;
+        }
+
+        // Find a MEGA link in the channel
+        const msgs = await ch.messages.fetch({ limit: 20 });
+        let foundLink = null, foundMessage = null;
+        for (const msg of msgs.values()) {
+          const texts = [msg.content || ''];
+          for (const e of msg.embeds || []) texts.push(flattenEmbed(e));
+          for (const text of texts) {
+            const links = extractMegaLinks(text);
+            if (links.length > 0) { foundLink = links[0]; foundMessage = msg; break; }
+          }
+          if (foundLink) break;
+        }
+
+        if (!foundLink) {
+          await interaction.editReply({ content: `❌ No MEGA link found in <#${ch.id}>.` });
+          return;
+        }
+
+        await interaction.editReply({ content: `⬇️ Downloading file from MEGA to regenerate link...` });
+
+        // Download
+        const tmpFile = path.join(os.tmpdir(), `regen-${Date.now()}.bin`);
+        const dlResult = await downloadMegaFile(foundLink, tmpFile, { timeoutMs: 300_000 });
+        const remoteName = dlResult?.name || path.basename(ch.name);
+
+        // Re-queue via the pipeline (onIngestLink triggers download → encrypt → upload)
+        if (typeof onIngestLink === 'function') {
+          // Don't delete tmpFile here — the async pipeline needs it
+          // Use foundLink (the original MEGA URL) to re-download+re-encrypt+reupload
+          onIngestLink(remoteName || ch.name, foundLink, null);
+          await interaction.editReply({
+            content: `🔄 **Regenerating** link for <#${ch.id}>...\nQueued in pipeline — the channel message will update when done.`,
+          });
+        } else {
+          await interaction.editReply({ content: `⚠️ Pipeline not available.` });
+        }
+        try { fs.unlinkSync(tmpFile); } catch {}
+      } catch (err) {
+        await interaction.editReply({ content: `❌ Error: ${err.message}` });
       }
       return;
     }
