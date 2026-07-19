@@ -55,7 +55,7 @@ const { updateState, getState, getAllStates, appendLog, removeState } = require(
 const { startGuiServer } = require('./gui/server');
 const { startDownloadEngine, pauseDownloads, resumeDownloads, cancelDownloads } = require('./downloadEngine');
 const downloadManager    = require('./downloadEngine/downloadManager');
-const { startMirrorEngine, stopMirrorEngine, getMirrorEngineStatus } = require('./mirrorEngine');
+const { startMirrorEngine, stopMirrorEngine } = require('./mirrorEngine');
 const { parseTxtFile }   = require('./txtLinkIngester');
 const { retryWithBackoff } = require('./utils/retry');
 
@@ -95,7 +95,6 @@ const envMap = {
   MEGA_EMAIL:        'megaEmail',
   MEGA_PASSWORD:     'megaPassword',
   GUI_PORT:          'guiPort',
-  VIRUSTOTAL_API_KEY:'virusTotalApiKey',
 };
 for (const [envKey, cfgKey] of Object.entries(envMap)) {
   if (process.env[envKey] !== undefined) config[cfgKey] = process.env[envKey];
@@ -471,29 +470,17 @@ async function main() {
   const client = await getClient(config);
   console.log(`[index] Discord bot logged in as ${client.user.tag}`);
 
-  // Automatically fall back to client.user.id if client ID is missing or set to placeholder
-  if (!config.discordClientId || config.discordClientId === 'SET_VIA_RAILWAY_ENV') {
-    config.discordClientId = client.user.id;
-  }
-  // Automatically fall back to botOwnerId if missing
-  if (!config.botOwnerId || config.botOwnerId === 'SET_VIA_RAILWAY_ENV') {
-    // If not set, use client application owner or default to bot client ID
-    config.botOwnerId = client.application?.owner?.id || null;
-    console.log(`[index] Bot owner ID resolved to: ${config.botOwnerId}`);
-  }
-
   if (config.discordClientId) {
     try {
       await registerCommands(config);
       attachCommandHandler(client, config, {
+        regenerateChannel,
         startMirrorEngine,
         stopMirrorEngine,
         getMirrorEngineStatus,
         pauseDownloads,
         resumeDownloads,
-        cancelDownloads,
-        downloadManager,        // for /check file download
-        regenerateChannel: startRegeneration,  // for /regen
+        cancelDownloads
       });
       console.log('[index] Slash commands registered.');
     } catch (err) {
@@ -551,7 +538,7 @@ process.on('unhandledRejection', (reason) => {
   console.error('[index] Unhandled rejection:', reason instanceof Error ? reason.message : reason);
 });
 
-async function startRegeneration(channelId) {
+async function regenerateChannel(channelId) {
   const allStates = getAllStates() || {};
   const entry = Object.entries(allStates).find(([_, st]) => st.channelId === channelId);
   if (!entry) throw new Error('No tracked file found for this channel ID.');
@@ -559,37 +546,35 @@ async function startRegeneration(channelId) {
   const oldLink = state.megaLink;
   if (!oldLink) throw new Error('No existing MEGA link found in state to regenerate from.');
 
-  // Validate immediately — throw before Discord times out
-  console.log(`[index] Queuing background regeneration for channel ${channelId} (${filename})`);
+  console.log(`[index] Starting regeneration for channel ${channelId} (${filename})`);
 
-  // Run the slow download + enqueue in the background
-  setImmediate(async () => {
-    try {
-      const dlFolder = downloadFolderPath;
-      if (!fs.existsSync(dlFolder)) fs.mkdirSync(dlFolder, { recursive: true });
-      const tempPath = path.join(dlFolder, `${Date.now()}-regen-${filename}`);
+  // Download old file
+  const dlFolder = downloadFolderPath;
+  if (!fs.existsSync(dlFolder)) fs.mkdirSync(dlFolder, { recursive: true });
+  const tempPath = path.join(dlFolder, `${Date.now()}-regen-${filename}`);
 
-      await downloadManager.downloadMegaFile(oldLink, tempPath, { timeoutMs: 300_000 });
+  await downloadManager.downloadMegaFile(oldLink, tempPath, { timeoutMs: 300000 });
 
-      const stagedPath = path.join(stagingFolderPath, filename);
-      if (fs.existsSync(stagedPath)) { try { fs.unlinkSync(stagedPath); } catch {} }
-      fs.copyFileSync(tempPath, stagedPath);
-      try { fs.unlinkSync(tempPath); } catch {}
+  // Stage it
+  const stagedPath = path.join(stagingFolderPath, filename);
+  if (fs.existsSync(stagedPath)) {
+    try { fs.unlinkSync(stagedPath); } catch {}
+  }
+  fs.copyFileSync(tempPath, stagedPath);
+  try { fs.unlinkSync(tempPath); } catch {}
 
-      updateState(filename, {
-        status:         'new',
-        megaLink:       null,
-        encryptedPath:  null,
-        sourcePassword: state.zipPassword || config.zipInputPassword || null,
-        error:          null,
-      });
-
-      enqueue(filename, stagedPath);
-      console.log(`[index] Background regeneration enqueued for "${filename}"`);
-    } catch (err) {
-      console.error(`[index] Background regeneration failed for "${filename}": ${err.message}`);
-    }
+  // Update state keeping messageId and channelId so we EDIT the old message instead of posting a new one!
+  updateState(filename, {
+    status: 'new',
+    megaLink: null,
+    encryptedPath: null,
+    // Use the stored zipPassword as the input password to decrypt the downloaded file
+    sourcePassword: state.zipPassword || config.zipInputPassword || null,
+    error: null,
   });
 
-  return filename; // returned immediately so Discord gets a reply right away
+  enqueue(filename, stagedPath);
+  return filename;
 }
+
+module.exports = { regenerateChannel };

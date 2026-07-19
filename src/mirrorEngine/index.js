@@ -59,33 +59,23 @@ try {
 }
 
 // ─── Paths ────────────────────────────────────────────────────────────────────
-// Storage priority:
-//   1. /data/  — Railway Volume (persistent across restarts)
-//   2. project root — local dev
-//   3. /tmp    — ephemeral fallback
-function resolveWritablePath(filename) {
-  const candidates = [
-    process.env.STATE_DIR ? path.join(process.env.STATE_DIR, filename) : null,
-    path.join('/data', filename),
-    path.join(__dirname, '..', '..', filename),
-    path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', filename),
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    try {
-      const dir = path.dirname(candidate);
-      fs.mkdirSync(dir, { recursive: true });
-      fs.accessSync(dir, fs.constants.W_OK);
-      return candidate;
-    } catch { /* try next */ }
+// Use /tmp for state and temp on read-only hosts (Railway). Fall back to project root locally.
+function resolveWritablePath(preferred) {
+  try {
+    fs.accessSync(path.dirname(preferred), fs.constants.W_OK);
+    return preferred;
+  } catch {
+    const tmp = process.env.TMPDIR || process.env.TEMP || '/tmp';
+    return path.join(tmp, path.basename(preferred));
   }
-  return path.join('/tmp', filename);
 }
 
-const STATE_PATH = resolveWritablePath('mirror-state.json');
-const TEMP_DIR   = resolveWritablePath('mirror-temp');
-// Ensure temp dir exists as a directory
-try { fs.mkdirSync(TEMP_DIR, { recursive: true }); } catch {}
+const STATE_PATH = resolveWritablePath(path.join(__dirname, '..', '..', 'mirror-state.json'));
+const TEMP_DIR   = (() => {
+  const preferred = path.join(__dirname, '..', '..', 'mirror-temp');
+  try { fs.accessSync(path.dirname(preferred), fs.constants.W_OK); return preferred; }
+  catch { return path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'mirror-temp'); }
+})();
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -159,78 +149,6 @@ async function encryptFileAsZip(rawFilePath, outputZipPath, password) {
 }
 
 // ─── Per-link pipeline ────────────────────────────────────────────────────────
-
-// Guild channel name cache — populated once per run to avoid 500+ API fetches
-let _guildChannelNames = null; // Set<string> of normalized channel names
-
-/**
- * Normalize a channel name for dedup comparison:
- *  - Converts Mathematical Bold Unicode letters/digits (used by toStylizedBold)
- *    back to their plain ASCII equivalents
- *  - Lowercases everything
- *  - Trims whitespace
- *
- * This makes comparison robust regardless of whether channelNameBoldStyle
- * is on or off, and regardless of how Discord's API stores the name.
- */
-function normalizeForDedup(str) {
-  if (!str) return '';
-  const UPPER_BASE = 0x1d400; // MATHEMATICAL BOLD CAPITAL A
-  const LOWER_BASE = 0x1d41a; // MATHEMATICAL BOLD SMALL a
-  const DIGIT_BASE = 0x1d7ce; // MATHEMATICAL BOLD DIGIT 0
-  let out = '';
-  for (const ch of str) { // iterates by code point (handles surrogate pairs)
-    const cp = ch.codePointAt(0);
-    if (cp >= UPPER_BASE && cp < UPPER_BASE + 26) {
-      out += String.fromCharCode(97 + (cp - UPPER_BASE)); // bold A-Z → a-z
-    } else if (cp >= LOWER_BASE && cp < LOWER_BASE + 26) {
-      out += String.fromCharCode(97 + (cp - LOWER_BASE)); // bold a-z → a-z
-    } else if (cp >= DIGIT_BASE && cp < DIGIT_BASE + 10) {
-      out += String.fromCharCode(48 + (cp - DIGIT_BASE)); // bold 0-9 → 0-9
-    } else {
-      out += ch.toLowerCase();
-    }
-  }
-
-  // Strip characters that Discord strips when creating text channels.
-  // We keep: a-z, 0-9, -, _, and any non-ASCII characters (emojis, CJK brackets, etc. where codePoint >= 128)
-  let cleaned = '';
-  for (const ch of out) {
-    const cp = ch.codePointAt(0);
-    if (
-      (cp >= 97 && cp <= 122) || // a-z
-      (cp >= 48 && cp <= 57) ||  // 0-9
-      ch === '-' || ch === '_' ||
-      cp >= 128
-    ) {
-      cleaned += ch;
-    }
-  }
-  return cleaned.trim();
-}
-
-async function buildGuildChannelCache(config) {
-  if (_guildChannelNames !== null) return; // already populated
-  try {
-    const botClient = await getClient(config);
-    const guild     = await botClient.guilds.fetch(config.guildId);
-    await guild.channels.fetch(); // populate discord.js cache
-
-    _guildChannelNames = new Set(
-      [...guild.channels.cache.values()]
-        .filter(ch => ch.type === 0) // GuildText = 0
-        .map(ch => normalizeForDedup(ch.name))
-    );
-
-    // Log a sample for debugging
-    const sample = [..._guildChannelNames].slice(0, 3).join(' | ');
-    console.log(`[mirrorEngine] Channel cache built: ${_guildChannelNames.size} channel(s). Sample: ${sample}`);
-  } catch (err) {
-    console.warn(`[mirrorEngine] Could not build channel cache: ${err.message}`);
-    _guildChannelNames = new Set();
-  }
-}
-
 async function processLink(entry, config) {
   const { link, name, categoryName } = entry;
   const mc = config.mirrorEngine;
@@ -265,24 +183,6 @@ async function processLink(entry, config) {
 
     const remoteExt = remoteName ? path.extname(remoteName).toLowerCase() : '';
     const isZip     = remoteExt === '.zip';
-
-    // ── 1.5. Discord dedup check using actual baseName ────────────────────
-    // Now that we know the real baseName (from MEGA), check if the target guild
-    // already has a channel with this exact name. If yes, the file was already
-    // delivered — skip the expensive encrypt/upload/post steps.
-    {
-      const { buildChannelName } = require('../unicodeFormatter');
-      // normalizeForDedup strips Mathematical Bold Unicode → plain ASCII so the
-      // comparison works regardless of channelNameBoldStyle setting.
-      const expectedChName = normalizeForDedup(buildChannelName(baseName, config));
-      console.log(`[mirrorEngine] dedup: "${baseName}" → "${expectedChName}" | cache size: ${_guildChannelNames?.size}`);
-      if (_guildChannelNames && _guildChannelNames.has(expectedChName)) {
-        setEntry(link, { status: 'done', error: null });
-        console.log(`[mirrorEngine] ⏭ Already delivered: ${baseName}`);
-        safeDelete(tmpDir);
-        return;
-      }
-    }
 
     // Rename download.bin to its real extension so 7zip can detect format
     const renamedPath = path.join(tmpDir, remoteName || `${baseName}${remoteExt || '.bin'}`);
@@ -614,9 +514,6 @@ async function runEngine(config) {
   const mc          = config.mirrorEngine;
   const concurrency = Math.max(1, mc.concurrency || 2);
 
-  // Reset channel name cache so it gets rebuilt fresh each run
-  _guildChannelNames = null;
-
   // ── Phase 1: Scan ────────────────────────────────────────────────────────
   console.log('[mirrorEngine] ── Phase 1: Scanning for MEGA links...');
   const found = await scanAllGuilds(config, _selfbot);
@@ -640,12 +537,6 @@ async function runEngine(config) {
     console.log('[mirrorEngine] Nothing to do — all links processed.');
     return;
   }
-
-  // ── Phase 1.5: Build channel dedup cache ─────────────────────────────────
-  // Fetch ALL channels in target guild ONCE — shared by all concurrent workers.
-  // Any link whose channel name already exists in the guild is skipped instantly.
-  console.log('[mirrorEngine] Building channel dedup cache from target guild...');
-  await buildGuildChannelCache(config);
 
   // ── Phase 2: Process ──────────────────────────────────────────────────────
   console.log(`[mirrorEngine] ── Phase 2: Processing ${pending.length} link(s) (concurrency=${concurrency})...`);

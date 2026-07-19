@@ -1,50 +1,27 @@
 'use strict';
 
-/**
- * stateStore.js — Persistent state for the main upload pipeline
- *
- * Storage priority:
- *   1. /data/state.json          — Railway Volume (survives restarts, preferred)
- *   2. <project-root>/state.json — Local dev (writable project dir)
- *   3. /tmp/mzb-state.json       — Last resort (ephemeral, Railway without volume)
- *
- * To avoid duplication on Railway restarts, mount a Volume at /data in the
- * Railway dashboard: Service → Volumes → Add Volume → Mount path: /data
- */
-
-const path         = require('path');
-const fs           = require('fs');
+const path        = require('path');
+const fs          = require('fs');
 const EventEmitter = require('events');
-const low          = require('lowdb');
-const FileSync     = require('lowdb/adapters/FileSync');
+const low         = require('lowdb');
+const FileSync    = require('lowdb/adapters/FileSync');
 
-// ── Resolve the best writable path for state storage ─────────────────────────
+// On Railway and other read-only hosts, the project root (/app) is read-only.
+// Write state to /tmp which is always writable. Fall back to project root locally.
 function resolveStatePath() {
-  const candidates = [
-    // 1. Railway Volume (persistent across restarts)
-    process.env.STATE_DIR ? path.join(process.env.STATE_DIR, 'state.json') : null,
-    '/data/state.json',
-    // 2. Project root (local dev)
-    path.join(__dirname, '..', 'state.json'),
-    // 3. Temp dir (Railway without volume — ephemeral fallback)
-    path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'mzb-state.json'),
-  ].filter(Boolean);
-
-  for (const candidate of candidates) {
-    try {
-      const dir = path.dirname(candidate);
-      fs.mkdirSync(dir, { recursive: true });
-      fs.accessSync(dir, fs.constants.W_OK);
-      if (candidate.includes('/data/') || candidate.includes('state.json')) {
-        const isVolume = candidate.startsWith('/data/');
-        console.log(`[stateStore] Using ${isVolume ? '📦 Railway Volume' : '📁 local'} state: ${candidate}`);
-      }
-      return candidate;
-    } catch { /* try next */ }
+  const preferred = path.join(__dirname, '..', 'state.json');
+  // Test writability by checking if the parent dir is writable
+  try {
+    fs.accessSync(path.dirname(preferred), fs.constants.W_OK);
+    return preferred;
+  } catch {
+    const tmp = path.join(
+      process.env.TMPDIR || process.env.TEMP || '/tmp',
+      'mzb-state.json'
+    );
+    console.log(`[stateStore] Using tmp path: ${tmp}`);
+    return tmp;
   }
-
-  // Should never reach here
-  return '/tmp/mzb-state.json';
 }
 
 const dbPath  = resolveStatePath();
@@ -54,6 +31,7 @@ const db      = low(adapter);
 db.defaults({ files: {}, logs: [] }).write();
 
 const emitter = new EventEmitter();
+// Increase max listeners to avoid spurious warnings when many pipeline workers attach
 emitter.setMaxListeners(50);
 
 /**
@@ -96,7 +74,7 @@ function removeState(filename) {
   emitter.emit('update', { filename, state: null });
 }
 
-// ── Upload Logs ───────────────────────────────────────────────────────────────
+// ── Upload Logs ──────────────────────────────────────────────────────────────
 function appendLog(entry) {
   const record = { ...entry, sentAt: new Date().toISOString() };
   db.get('logs').push(record).write();

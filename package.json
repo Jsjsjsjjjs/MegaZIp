@@ -4,8 +4,7 @@
   "description": "Watches a folder for zip files, password-encrypts them, uploads to MEGA, and posts links to auto-created Discord channels.",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "reset-commands": "node scripts/reset-commands.js"
+    "start": "node src/index.js"
   },
   "engines": {
     "node": ">=20.0.0"
