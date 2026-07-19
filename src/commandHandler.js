@@ -4,7 +4,6 @@ const path = require('path');
 const { getAllStates, getLogs } = require('./stateStore');
 const { editZipMessage } = require('./webhookSender');
 const { getFileSha256, getFileReport, scanUrl } = require('./virusTotal');
-const { invalidateSession } = require('./megaUploader');
 
 const configPath = path.join(__dirname, '..', 'config', 'config.json');
 
@@ -87,11 +86,6 @@ async function registerCommands(config) {
             { name: 'Cancel Pending Jobs', value: 'cancel' }
           )
       )
-      .toJSON(),
-
-    new SlashCommandBuilder()
-      .setName('invalidatesession')
-      .setDescription('Clear saved MEGA session — forces a fresh login on next upload (use after password change)')
       .toJSON(),
   ];
 
@@ -263,16 +257,6 @@ function attachCommandHandler(client, config, actions = {}) {
         if (typeof actions.cancelDownloads === 'function') actions.cancelDownloads();
         await interaction.reply({ content: '⏹️ All active and pending download queue jobs cancelled.', ephemeral: true });
       }
-      return;
-    }
-
-    // ── /invalidatesession ────────────────────────────────────────────────────
-    if (interaction.commandName === 'invalidatesession') {
-      invalidateSession();
-      await interaction.reply({
-        content: '🔄 **MEGA session cleared.** The bot will perform a fresh email/password login on the next upload.\n💡 Use this whenever you change your MEGA account password to avoid "EBLOCKED" or session errors.',
-        ephemeral: true
-      });
       return;
     }
 
