@@ -153,6 +153,18 @@ async function registerCommands(config) {
           )
       )
       .toJSON(),
+
+    // ── /fetch — Scan source server → .txt → pipeline ─────────────────────────
+    new SlashCommandBuilder()
+      .setName('fetch')
+      .setDescription('Scan source server for MEGA links, export as .txt attachment (owner only)')
+      .toJSON(),
+
+    // ── /mg — List MEGA account files → .txt → pipeline ───────────────────────
+    new SlashCommandBuilder()
+      .setName('mg')
+      .setDescription('List all files in your MEGA account and export as .txt (owner only)')
+      .toJSON(),
   ];
 
   const rest = new REST({ version: '10' }).setToken(config.discordToken);
@@ -543,6 +555,169 @@ function attachCommandHandler(client, config, {
       } catch (err) {
         await interaction.editReply({ content: `❌ Error: ${err.message}` });
       }
+      return;
+    }
+
+    // ── /fetch — Scan source server, export MEGA links as .txt ───────────────
+    if (cmd === 'fetch') {
+      if (!isOwner) { await interaction.reply({ content: '🚫 Owner only.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+
+      try {
+        const { startScan } = require('./mirrorEngine/scanner');
+        await interaction.editReply({ content: '🔍 Scanning source server for MEGA links…' });
+
+        const found = await startScan(config); // returns [{link, name, categoryName}]
+        if (!found || found.length === 0) {
+          await interaction.editReply({ content: '⚠️ No MEGA links found in source server.' });
+          return;
+        }
+
+        // Write .txt (format: name | link | category)
+        const lines = found.map(f => `${f.name || 'unnamed'} | ${f.link} | ${f.categoryName || ''}`);
+        const txtPath = path.join(os.tmpdir(), `fetch-${Date.now()}.txt`);
+        fs.writeFileSync(txtPath, lines.join('\n'), 'utf-8');
+
+        const { ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder } = require('discord.js');
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`fetch_pipeline_${Date.now()}`)
+            .setLabel(`🚀 Hand ${found.length} links to Pipeline`)
+            .setStyle(ButtonStyle.Success)
+        );
+
+        await interaction.editReply({
+          content: `✅ Found **${found.length}** MEGA link(s). See attachment.\nClick the button to process all links.`,
+          files: [new AttachmentBuilder(txtPath, { name: 'mega-links.txt' })],
+          components: [row],
+        });
+
+        // Store for button handler
+        client._fetchBuffer = { links: found, txtPath };
+
+      } catch (err) {
+        await interaction.editReply({ content: `❌ Error: ${err.message}` });
+      }
+      return;
+    }
+
+    // ── /mg — List MEGA account files, export as .txt ──────────────────────────
+    if (cmd === 'mg') {
+      if (!isOwner) { await interaction.reply({ content: '🚫 Owner only.', ephemeral: true }); return; }
+      await interaction.deferReply({ ephemeral: true });
+
+      try {
+        await interaction.editReply({ content: '🔐 Connecting to your MEGA account…' });
+
+        const { getStorageForConfig } = require('./megaUploader');
+        const storage = await getStorageForConfig(config);
+        const files   = Object.values(storage.files || {}).filter(f => f && !f.directory && f.name);
+
+        if (files.length === 0) {
+          await interaction.editReply({ content: '⚠️ No files found in your MEGA account.' });
+          return;
+        }
+
+        await interaction.editReply({ content: `📂 Found **${files.length}** file(s). Generating links…` });
+
+        const lines = [];
+        for (const file of files) {
+          try {
+            const link = await file.link(false); // false = no expiry
+            lines.push(`${file.name} | ${link}`);
+          } catch { lines.push(`${file.name} | (link error)`); }
+        }
+
+        const txtPath = path.join(os.tmpdir(), `mega-files-${Date.now()}.txt`);
+        fs.writeFileSync(txtPath, lines.join('\n'), 'utf-8');
+
+        const { ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder } = require('discord.js');
+        const ts = Date.now();
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`mg_pipeline_${ts}`)
+            .setLabel(`🚀 Process all ${files.length} in Pipeline`)
+            .setStyle(ButtonStyle.Success),
+          new ButtonBuilder()
+            .setCustomId(`mg_download_${ts}`)
+            .setLabel('📄 Just download .txt')
+            .setStyle(ButtonStyle.Secondary)
+        );
+
+        await interaction.editReply({
+          content: `✅ **${files.length}** files in your MEGA account.\nClick a button below:`,
+          files: [new AttachmentBuilder(txtPath, { name: 'my-mega-files.txt' })],
+          components: [row],
+        });
+
+        // Store for button handler
+        client._mgBuffer = { lines, txtPath };
+
+      } catch (err) {
+        await interaction.editReply({ content: `❌ Error: ${err.message}` });
+      }
+      return;
+    }
+  });
+
+  // ── Button interaction handler (for /fetch and /mg buttons) ──────────────────
+  client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+    const id = interaction.customId;
+
+    // /fetch pipeline button
+    if (id.startsWith('fetch_pipeline_')) {
+      await interaction.deferUpdate();
+      const buf = client._fetchBuffer;
+      if (!buf || !buf.links) {
+        await interaction.editReply({ content: '⚠️ Link data expired. Run /fetch again.', components: [] });
+        return;
+      }
+      let queued = 0;
+      for (const { link, name } of buf.links) {
+        if (typeof onIngestLink === 'function') {
+          try { onIngestLink(name || link, link, null); queued++; } catch {}
+        }
+      }
+      try { fs.unlinkSync(buf.txtPath); } catch {}
+      client._fetchBuffer = null;
+      await interaction.editReply({
+        content: `🚀 **${queued}** links handed to pipeline! Monitor progress with \`/status\`.`,
+        components: [],
+      });
+      return;
+    }
+
+    // /mg pipeline button
+    if (id.startsWith('mg_pipeline_')) {
+      await interaction.deferUpdate();
+      const buf = client._mgBuffer;
+      if (!buf || !buf.lines) {
+        await interaction.editReply({ content: '⚠️ Data expired. Run /mg again.', components: [] });
+        return;
+      }
+      let queued = 0;
+      for (const line of buf.lines) {
+        const parts = line.split(' | ');
+        const name = parts[0];
+        const link = parts[1];
+        if (link && link.startsWith('http') && typeof onIngestLink === 'function') {
+          try { onIngestLink(name, link, null); queued++; } catch {}
+        }
+      }
+      try { fs.unlinkSync(buf.txtPath); } catch {}
+      client._mgBuffer = null;
+      await interaction.editReply({
+        content: `🚀 **${queued}** MEGA links handed to pipeline! Monitor with \`/status\`.`,
+        components: [],
+      });
+      return;
+    }
+
+    // /mg download-only button (just dismiss the buttons)
+    if (id.startsWith('mg_download_')) {
+      await interaction.deferUpdate();
+      await interaction.editReply({ content: '✅ .txt file sent above. Buttons dismissed.', components: [] });
       return;
     }
   });

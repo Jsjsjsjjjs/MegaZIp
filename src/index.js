@@ -263,7 +263,6 @@ async function processZip(filename, rawZipPath, meta = {}) {
       );
       updateState(filename, { status: 'uploaded', megaLink, error: null });
       console.log(`[index] Uploaded "${filename}" → ${megaLink}`);
-      // Delete the entire temp encrypted dir (created by mkdtempSync in zipEncryptor)
       try { fs.rmSync(path.dirname(encryptedPath), { recursive: true, force: true }); } catch {}
     } catch (err) {
       console.error(`[index] MEGA upload failed for "${filename}": ${err.message}`);
@@ -274,12 +273,15 @@ async function processZip(filename, rawZipPath, meta = {}) {
   }
 
   // ── Step 3: Discord channel ──────────────────────────────────────────────
-  let channel = null;
+  let channel  = null;
+  let batchMode = state.batchMode || false;
+  let placeholderMsgId = state.placeholderMsgId || null;
 
   if (state.channelId) {
     try {
       const client = await getClient(config);
       channel = await client.channels.fetch(state.channelId);
+      batchMode = state.batchMode || false;
     } catch { channel = null; }
   }
 
@@ -288,7 +290,7 @@ async function processZip(filename, rawZipPath, meta = {}) {
       const channelOptions = {
         sourceCategoryName: state.sourceCategoryName || meta.sourceCategoryName || null,
       };
-      channel = await retryWithBackoff(
+      const result = await retryWithBackoff(
         () => createZipChannel(baseName, config, channelOptions),
         {
           retries: 3,
@@ -297,7 +299,20 @@ async function processZip(filename, rawZipPath, meta = {}) {
             console.warn(`[index] Channel creation attempt ${attempt} failed for "${filename}": ${err.message}`),
         }
       );
-      updateState(filename, { status: 'channel_created', channelId: channel.id, error: null });
+      channel   = result.channel;
+      batchMode = result.batchMode || false;
+      updateState(filename, { status: 'channel_created', channelId: channel.id, batchMode, error: null });
+
+      // Post a placeholder message so users see activity in the channel right away
+      if (!batchMode && !placeholderMsgId) {
+        try {
+          const wh = await channel.fetchWebhooks().then(whs => whs.find(w => w.name === 'ZipBot Delivery') ||
+            channel.createWebhook({ name: 'ZipBot Delivery' }));
+          const ph = await wh.send({ content: `⏳ **${baseName}** — uploading to MEGA, please wait…` });
+          placeholderMsgId = ph.id;
+          updateState(filename, { placeholderMsgId });
+        } catch { /* placeholder is best-effort */ }
+      }
     } catch (err) {
       console.error(`[index] Channel creation failed for "${filename}": ${err.message}`);
       updateState(filename, { status: 'failed', error: `Channel: ${err.message}` });
@@ -305,22 +320,43 @@ async function processZip(filename, rawZipPath, meta = {}) {
     }
   }
 
-  // ── Step 4: Send message ─────────────────────────────────────────────────
+  // ── Step 4: Send / update message ────────────────────────────────────────
   try {
-    const sentMessage = await retryWithBackoff(
-      () => sendZipMessage(channel, { name: baseName, link: megaLink, password }, config),
-      {
-        retries: 3,
-        delaysMs: [2000, 5000, 10000],
-        onAttemptFail: (attempt, err) =>
-          console.warn(`[index] Message send attempt ${attempt} failed for "${filename}": ${err.message}`),
+    if (batchMode) {
+      // Batch embed mode: guild at channel limit — post a compact embed to the batch channel
+      await channel.send({
+        embeds: [{
+          color: 0x5865F2,
+          title: baseName,
+          description: `🔗 ${megaLink}\n🔑 \`${password}\``,
+          timestamp: new Date().toISOString(),
+        }],
+      });
+      updateState(filename, { status: 'message_sent', messageId: null, error: null });
+    } else {
+      // Normal mode: send/edit via webhook
+      let sentMessage;
+      if (placeholderMsgId) {
+        // Edit the placeholder instead of sending a new message
+        const { editZipMessage } = require('./webhookSender');
+        await editZipMessage(channel, placeholderMsgId, { name: baseName, link: megaLink, password }, config);
+        sentMessage = { id: placeholderMsgId };
+      } else {
+        sentMessage = await retryWithBackoff(
+          () => sendZipMessage(channel, { name: baseName, link: megaLink, password }, config),
+          {
+            retries: 3,
+            delaysMs: [2000, 5000, 10000],
+            onAttemptFail: (attempt, err) =>
+              console.warn(`[index] Message send attempt ${attempt} failed for "${filename}": ${err.message}`),
+          }
+        );
       }
-    );
+      const messageId = sentMessage?.id || null;
+      updateState(filename, { status: 'message_sent', messageId, placeholderMsgId: null, error: null });
+    }
 
-    const messageId = sentMessage?.id || null;
-    updateState(filename, { status: 'message_sent', messageId, error: null });
-
-    appendLog({ filename, megaLink, zipPassword: password, channelId: channel.id, channelName: channel.name, messageId });
+    appendLog({ filename, megaLink, zipPassword: password, channelId: channel.id, channelName: channel.name, messageId: state.messageId });
     console.log(`[index] ✅ Done: "${filename}"`);
   } catch (err) {
     console.error(`[index] Message failed for "${filename}": ${err.message}`);

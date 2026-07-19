@@ -152,4 +152,12 @@ async function uploadToMega(filePath, config) {
   return link;
 }
 
-module.exports = { uploadToMega };
+/**
+ * Returns the raw megajs Storage instance for a given config.
+ * Used by /mg to list account files and generate public links.
+ */
+async function getStorageForConfig(config) {
+  return getStorage(config);
+}
+
+module.exports = { uploadToMega, getStorageForConfig };
