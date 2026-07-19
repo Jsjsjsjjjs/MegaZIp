@@ -55,7 +55,7 @@ const { updateState, getState, getAllStates, appendLog, removeState } = require(
 const { startGuiServer } = require('./gui/server');
 const { startDownloadEngine, pauseDownloads, resumeDownloads, cancelDownloads } = require('./downloadEngine');
 const downloadManager    = require('./downloadEngine/downloadManager');
-const { startMirrorEngine, stopMirrorEngine } = require('./mirrorEngine');
+const { startMirrorEngine, stopMirrorEngine, getMirrorEngineStatus } = require('./mirrorEngine');
 const { parseTxtFile }   = require('./txtLinkIngester');
 const { retryWithBackoff } = require('./utils/retry');
 
