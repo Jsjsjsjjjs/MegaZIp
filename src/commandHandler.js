@@ -11,8 +11,15 @@ const configPath = path.join(__dirname, '..', 'config', 'config.json');
  * Registers all slash commands for a single guild.
  */
 async function registerCommands(config) {
-  if (!config.discordClientId) {
-    throw new Error('discordClientId missing in config.json (needed to register slash commands)');
+  const token = config.discordToken;
+  const clientId = config.discordClientId;
+  const guildId = config.guildId;
+
+  if (!clientId || clientId === 'SET_VIA_RAILWAY_ENV' || clientId.includes('YOUR_') ||
+      !token || token === 'SET_VIA_RAILWAY_ENV' || token.includes('YOUR_') ||
+      !guildId || guildId === 'SET_VIA_RAILWAY_ENV' || guildId.includes('YOUR_')) {
+    console.warn('[commandHandler] Skipping slash command registration — placeholder or missing client ID, token, or guild ID.');
+    return;
   }
 
   const commands = [
@@ -85,6 +92,14 @@ async function registerCommands(config) {
             { name: 'Resume Queue', value: 'resume' },
             { name: 'Cancel Pending Jobs', value: 'cancel' }
           )
+      )
+      .toJSON(),
+
+    new SlashCommandBuilder()
+      .setName('dcheck')
+      .setDescription('Delete duplicate text channels in the server by normalizing bold names to ASCII (owner only)')
+      .addBooleanOption((o) =>
+        o.setName('dryrun').setDescription('Only list the duplicate channels without deleting them (default: false)')
       )
       .toJSON(),
   ];
@@ -427,6 +442,85 @@ function attachCommandHandler(client, config, actions = {}) {
         await interaction.editReply({
           content: `🔍 **VirusTotal Results**\n\n⚠️ Error running scan: *${err.message}*`
         });
+      }
+      return;
+    }
+
+    // ── /dcheck ──────────────────────────────────────────────────────────────
+    if (interaction.commandName === 'dcheck') {
+      const dryrun = interaction.options.getBoolean('dryrun') ?? false;
+      await interaction.deferReply({ ephemeral: true });
+
+      try {
+        const { fromStylizedBold } = require('./unicodeFormatter');
+        const guild = interaction.guild;
+        if (!guild) {
+          throw new Error('This command can only be run in a Discord server.');
+        }
+
+        // Fetch all channels
+        await guild.channels.fetch();
+        const textChannels = [...guild.channels.cache.values()].filter(
+          (ch) => ch.type === ChannelType.GuildText
+        );
+
+        const groups = {}; // normalizedName -> channel objects
+        for (const ch of textChannels) {
+          const plain = fromStylizedBold(ch.name);
+          const normalized = plain.toLowerCase().replace(/^[『🎐』|\s-]+/, '').trim();
+          if (!normalized) continue; // Skip channels with empty ascii conversion
+          if (!groups[normalized]) groups[normalized] = [];
+          groups[normalized].push(ch);
+        }
+
+        const duplicates = [];
+        const logs = [];
+
+        for (const [normalized, list] of Object.entries(groups)) {
+          if (list.length > 1) {
+            // Sort by ID ascending (oldest channel created first)
+            list.sort((a, b) => a.id.localeCompare(b.id));
+            const keep = list[0];
+            const dupes = list.slice(1);
+            for (const d of dupes) {
+              duplicates.push(d);
+              logs.push(`• Duplicate: <#${d.id}> (Bold name: \`${d.name}\` -> ASCII: \`${fromStylizedBold(d.name)}\`) | Keep: <#${keep.id}> (\`${keep.name}\`)`);
+            }
+          }
+        }
+
+        if (duplicates.length === 0) {
+          await interaction.editReply({ content: '✅ No duplicate text channels found in this server.' });
+          return;
+        }
+
+        if (dryrun) {
+          const listText = logs.slice(0, 15).join('\n') + (logs.length > 15 ? `\n*...and ${logs.length - 15} more channels.*` : '');
+          await interaction.editReply({
+            content: `🔍 **[DRY RUN] Found ${duplicates.length} duplicate channels:**\n\n${listText}\n\n*No channels were deleted because dryrun option was set to true.*`
+          });
+          return;
+        }
+
+        // Delete duplicates
+        let deletedCount = 0;
+        let failCount = 0;
+        for (const ch of duplicates) {
+          try {
+            await ch.delete('Duplicate cleanup via /dcheck command');
+            deletedCount++;
+          } catch (err) {
+            console.warn(`[commandHandler] /dcheck failed to delete channel ${ch.name} (${ch.id}): ${err.message}`);
+            failCount++;
+          }
+        }
+
+        await interaction.editReply({
+          content: `🧹 **Cleanup Complete!**\n• Duplicate channels found: **${duplicates.length}**\n• Successfully deleted: **${deletedCount}**\n• Failed to delete: **${failCount}**`
+        });
+
+      } catch (err) {
+        await interaction.editReply({ content: `❌ Error running duplicate check: ${err.message}` });
       }
       return;
     }
