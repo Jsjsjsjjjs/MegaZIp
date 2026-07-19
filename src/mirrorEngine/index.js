@@ -161,23 +161,57 @@ async function encryptFileAsZip(rawFilePath, outputZipPath, password) {
 // ─── Per-link pipeline ────────────────────────────────────────────────────────
 
 // Guild channel name cache — populated once per run to avoid 500+ API fetches
-let _guildChannelNames = null; // Set<string> of lowercase channel names
+let _guildChannelNames = null; // Set<string> of normalized channel names
+
+/**
+ * Normalize a channel name for dedup comparison:
+ *  - Converts Mathematical Bold Unicode letters/digits (used by toStylizedBold)
+ *    back to their plain ASCII equivalents
+ *  - Lowercases everything
+ *  - Trims whitespace
+ *
+ * This makes comparison robust regardless of whether channelNameBoldStyle
+ * is on or off, and regardless of how Discord's API stores the name.
+ */
+function normalizeForDedup(str) {
+  const UPPER_BASE = 0x1d400; // MATHEMATICAL BOLD CAPITAL A
+  const LOWER_BASE = 0x1d41a; // MATHEMATICAL BOLD SMALL a
+  const DIGIT_BASE = 0x1d7ce; // MATHEMATICAL BOLD DIGIT 0
+  let out = '';
+  for (const ch of str) { // iterates by code point (handles surrogate pairs)
+    const cp = ch.codePointAt(0);
+    if (cp >= UPPER_BASE && cp < UPPER_BASE + 26) {
+      out += String.fromCharCode(97 + (cp - UPPER_BASE)); // bold A-Z → a-z
+    } else if (cp >= LOWER_BASE && cp < LOWER_BASE + 26) {
+      out += String.fromCharCode(97 + (cp - LOWER_BASE)); // bold a-z → a-z
+    } else if (cp >= DIGIT_BASE && cp < DIGIT_BASE + 10) {
+      out += String.fromCharCode(48 + (cp - DIGIT_BASE)); // bold 0-9 → 0-9
+    } else {
+      out += ch.toLowerCase();
+    }
+  }
+  return out.trim();
+}
 
 async function buildGuildChannelCache(config) {
   if (_guildChannelNames !== null) return; // already populated
   try {
     const botClient = await getClient(config);
     const guild     = await botClient.guilds.fetch(config.guildId);
-    await guild.channels.fetch(); // populate cache
+    await guild.channels.fetch(); // populate discord.js cache
+
     _guildChannelNames = new Set(
-      guild.channels.cache
-        .filter(ch => ch.type === 0) // ChannelType.GuildText = 0
-        .map(ch => ch.name.toLowerCase())
+      [...guild.channels.cache.values()]
+        .filter(ch => ch.type === 0) // GuildText = 0
+        .map(ch => normalizeForDedup(ch.name))
     );
-    console.log(`[mirrorEngine] Channel cache built: ${_guildChannelNames.size} text channel(s) in target guild.`);
+
+    // Log a sample for debugging
+    const sample = [..._guildChannelNames].slice(0, 3).join(' | ');
+    console.log(`[mirrorEngine] Channel cache built: ${_guildChannelNames.size} channel(s). Sample: ${sample}`);
   } catch (err) {
     console.warn(`[mirrorEngine] Could not build channel cache: ${err.message}`);
-    _guildChannelNames = new Set(); // empty set — dedup check will just skip (safe)
+    _guildChannelNames = new Set();
   }
 }
 
@@ -222,7 +256,10 @@ async function processLink(entry, config) {
     // delivered — skip the expensive encrypt/upload/post steps.
     {
       const { buildChannelName } = require('../unicodeFormatter');
-      const expectedChName = buildChannelName(baseName, config).toLowerCase();
+      // normalizeForDedup strips Mathematical Bold Unicode → plain ASCII so the
+      // comparison works regardless of channelNameBoldStyle setting.
+      const expectedChName = normalizeForDedup(buildChannelName(baseName, config));
+      console.log(`[mirrorEngine] dedup: "${baseName}" → "${expectedChName}" | cache size: ${_guildChannelNames?.size}`);
       if (_guildChannelNames && _guildChannelNames.has(expectedChName)) {
         setEntry(link, { status: 'done', error: null });
         console.log(`[mirrorEngine] ⏭ Already delivered: ${baseName}`);
