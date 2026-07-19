@@ -169,6 +169,46 @@ async function processLink(entry, config) {
   const tmpDir = path.join(TEMP_DIR, crypto.randomBytes(8).toString('hex'));
   fs.mkdirSync(tmpDir, { recursive: true });
 
+  // ── 0. Discord deduplication check (survives state loss) ─────────────────
+  // Before spending time downloading/encrypting, check if the target guild
+  // already has a channel for this file that contains a delivered message.
+  // This makes restarts safe even without a persistent state file.
+  try {
+    const botClient = await getClient(config);
+    const guild     = await botClient.guilds.fetch(config.guildId);
+    await guild.channels.fetch();
+
+    const { buildChannelName } = require('../unicodeFormatter');
+    const expectedChName = buildChannelName(name, config);
+
+    const existingCh = guild.channels.cache.find(
+      (ch) => ch.name.toLowerCase() === expectedChName.toLowerCase()
+    );
+
+    if (existingCh) {
+      // Channel already exists — check if it has any messages (i.e. already delivered)
+      try {
+        const msgs = await existingCh.messages.fetch({ limit: 5 });
+        if (msgs.size > 0) {
+          // Already delivered — mark done and skip the whole pipeline
+          const firstMsg = msgs.first();
+          setEntry(link, {
+            status:    'done',
+            channelId: existingCh.id,
+            messageId: firstMsg?.id || null,
+            error:     null,
+          });
+          console.log(`[mirrorEngine] ⏭ Already delivered: ${name} — skipping.`);
+          safeDelete(tmpDir);
+          return;
+        }
+      } catch { /* can't fetch messages — proceed normally */ }
+    }
+  } catch (preCheckErr) {
+    // Pre-check is best-effort; don't block the pipeline if it fails
+    console.warn(`[mirrorEngine] Pre-check warning for "${name}": ${preCheckErr.message}`);
+  }
+
   try {
 
     // ── 1. Download ────────────────────────────────────────────────────────
