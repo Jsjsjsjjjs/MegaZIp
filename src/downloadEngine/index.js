@@ -37,10 +37,6 @@ function startDownloadEngine(config, onDownloaded) {
     return;
   }
 
-  // Reset scan states so that the bot starts scanning channels from the beginning of history in every run
-  const { resetScanState } = require('./scanState');
-  resetScanState();
-
   downloadManager.init(config);
 
   const runScan = async () => {

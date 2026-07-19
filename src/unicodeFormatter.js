@@ -86,26 +86,4 @@ function buildChannelName(zipBaseName, config = {}) {
   return fullName;
 }
 
-function fromStylizedBold(stylizedText) {
-  if (!stylizedText) return '';
-  let result = '';
-  // Use Array.from to iterate correctly over surrogate pairs/code points
-  for (const ch of Array.from(stylizedText)) {
-    const code = ch.codePointAt(0);
-    if (code >= 0x1d400 && code <= 0x1d419) {
-      // Bold capital A-Z -> normal ASCII A-Z (65-90)
-      result += String.fromCharCode(65 + (code - 0x1d400));
-    } else if (code >= 0x1d41a && code <= 0x1d433) {
-      // Bold lowercase a-z -> normal ASCII a-z (97-122)
-      result += String.fromCharCode(97 + (code - 0x1d41a));
-    } else if (code >= 0x1d7ce && code <= 0x1d7d7) {
-      // Bold digits 0-9 -> normal ASCII 0-9 (48-57)
-      result += String.fromCharCode(48 + (code - 0x1d7ce));
-    } else {
-      result += ch;
-    }
-  }
-  return result;
-}
-
-module.exports = { toStylizedBold, fromStylizedBold, buildChannelName };
+module.exports = { toStylizedBold, buildChannelName };
