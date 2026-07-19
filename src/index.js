@@ -295,7 +295,7 @@ async function _processZipInner(filename, rawZipPath, meta = {}) {
   let batchGuild   = null;
   let placeholderMsgId = state.placeholderMsgId || null;
 
-  if (state.channelId && !batchMode) {
+  if (state.channelId && state.channelId !== 'batch' && !batchMode) {
     try {
       const client = await getClient(config);
       channel = await client.channels.fetch(state.channelId);

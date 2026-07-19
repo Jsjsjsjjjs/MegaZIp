@@ -45,7 +45,7 @@ const { Client: SelfbotClient } = require('discord.js-selfbot-v13');
 const { encryptZip, generatePassword } = require('../zipEncryptor');
 
 const { uploadToMega }   = require('../megaUploader');
-const { createZipChannel } = require('../discordManager');
+const { createZipChannel, addToBatch } = require('../discordManager');
 const { sendZipMessage } = require('../webhookSender');
 const downloadManager    = require('../downloadEngine/downloadManager');
 const { extractMegaLinks, extractSuggestedName, flattenEmbed } = require('../downloadEngine/linkExtractor');
@@ -250,19 +250,28 @@ async function processLink(entry, config) {
     // ── 4. Create Discord channel (with cloned category) ──────────────────
     const existingEntry = getEntry(link);
     let channel = null;
+    let batchMode = existingEntry?.batchMode || false;
+    let batchGuild = null;
 
-    if (existingEntry?.channelId) {
+    if (existingEntry?.channelId && existingEntry.channelId !== 'batch') {
       try {
         const botClient = await getClient(config);
         channel = await botClient.channels.fetch(existingEntry.channelId);
       } catch { channel = null; }
     }
 
-    if (!channel) {
+    if (!channel && !batchMode) {
       setEntry(link, { status: 'channel_creating' });
       try {
-        channel = await createZipChannel(baseName, config, { sourceCategoryName: categoryName });
-        setEntry(link, { status: 'channel_created', channelId: channel.id });
+        const result = await createZipChannel(baseName, config, { sourceCategoryName: categoryName });
+        channel = result.channel;
+        batchMode = result.batchMode || false;
+        batchGuild = result.guild || null;
+        if (!batchMode) {
+          setEntry(link, { status: 'channel_created', channelId: channel.id, batchMode: false });
+        } else {
+          setEntry(link, { status: 'channel_created', channelId: 'batch', batchMode: true });
+        }
       } catch (err) {
         throw new Error(`Channel: ${err.message}`);
       }
@@ -270,19 +279,37 @@ async function processLink(entry, config) {
 
     // ── 5. Send message ────────────────────────────────────────────────────
     try {
-      const sent = await sendZipMessage(
-        channel,
-        { name: baseName, link: megaLink, password: outputPassword },
-        config
-      );
-      setEntry(link, {
-        status:    'done',
-        megaLink,
-        password:  outputPassword,
-        channelId: channel.id,
-        messageId: sent?.id || null,
-        error:     null,
-      });
+      if (batchMode) {
+        if (!batchGuild) {
+          const botClient = await getClient(config);
+          batchGuild = await botClient.guilds.fetch(config.guildId);
+        }
+        await addToBatch(batchGuild, config, baseName, megaLink);
+        setEntry(link, {
+          status:    'done',
+          megaLink,
+          password:  outputPassword,
+          channelId: 'batch',
+          messageId: null,
+          error:     null,
+          batchMode: true,
+        });
+      } else {
+        const sent = await sendZipMessage(
+          channel,
+          { name: baseName, link: megaLink, password: outputPassword },
+          config
+        );
+        setEntry(link, {
+          status:    'done',
+          megaLink,
+          password:  outputPassword,
+          channelId: channel.id,
+          messageId: sent?.id || null,
+          error:     null,
+          batchMode: false,
+        });
+      }
       console.log(`[mirrorEngine] ✓ ${baseName}`);
     } catch (err) {
       throw new Error(`Post: ${err.message}`);

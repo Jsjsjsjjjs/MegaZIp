@@ -558,9 +558,24 @@ function attachCommandHandler(client, config, {
       return;
     }
 
+    // Initialize buffer maps if they don't exist
+    client._fetchBuffers = client._fetchBuffers || new Map();
+    client._mgBuffers    = client._mgBuffers || new Map();
+
     // ── /fetch — Scan source server, export MEGA links as .txt ───────────────
     if (cmd === 'fetch') {
       if (!isOwner) { await interaction.reply({ content: '🚫 Owner only.', ephemeral: true }); return; }
+
+      // Conflict guard: do not fetch if mirror engine is currently running
+      const mirrorStatus = mirrorControls.getStatus?.() || { running: false };
+      if (mirrorStatus.running) {
+        await interaction.reply({
+          content: '⚠️ The mirror engine is currently running. Please stop it or wait for it to finish before fetching.',
+          ephemeral: true
+        });
+        return;
+      }
+
       await interaction.deferReply({ ephemeral: true });
 
       try {
@@ -573,15 +588,17 @@ function attachCommandHandler(client, config, {
           return;
         }
 
+        const ts = Date.now().toString();
+
         // Write .txt (format: name | link | category)
         const lines = found.map(f => `${f.name || 'unnamed'} | ${f.link} | ${f.categoryName || ''}`);
-        const txtPath = path.join(os.tmpdir(), `fetch-${Date.now()}.txt`);
+        const txtPath = path.join(os.tmpdir(), `fetch-${ts}.txt`);
         fs.writeFileSync(txtPath, lines.join('\n'), 'utf-8');
 
         const { ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder } = require('discord.js');
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder()
-            .setCustomId(`fetch_pipeline_${Date.now()}`)
+            .setCustomId(`fetch_pipeline_${ts}`)
             .setLabel(`🚀 Hand ${found.length} links to Pipeline`)
             .setStyle(ButtonStyle.Success)
         );
@@ -592,8 +609,8 @@ function attachCommandHandler(client, config, {
           components: [row],
         });
 
-        // Store for button handler
-        client._fetchBuffer = { links: found, txtPath };
+        // Store in buffer map with unique timestamp key
+        client._fetchBuffers.set(ts, { links: found, txtPath });
 
       } catch (err) {
         await interaction.editReply({ content: `❌ Error: ${err.message}` });
@@ -628,11 +645,11 @@ function attachCommandHandler(client, config, {
           } catch { lines.push(`${file.name} | (link error)`); }
         }
 
-        const txtPath = path.join(os.tmpdir(), `mega-files-${Date.now()}.txt`);
+        const ts = Date.now().toString();
+        const txtPath = path.join(os.tmpdir(), `mega-files-${ts}.txt`);
         fs.writeFileSync(txtPath, lines.join('\n'), 'utf-8');
 
         const { ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder } = require('discord.js');
-        const ts = Date.now();
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder()
             .setCustomId(`mg_pipeline_${ts}`)
@@ -650,8 +667,8 @@ function attachCommandHandler(client, config, {
           components: [row],
         });
 
-        // Store for button handler
-        client._mgBuffer = { lines, txtPath };
+        // Store in buffer map with unique timestamp key
+        client._mgBuffers.set(ts, { lines, txtPath });
 
       } catch (err) {
         await interaction.editReply({ content: `❌ Error: ${err.message}` });
@@ -665,10 +682,16 @@ function attachCommandHandler(client, config, {
     if (!interaction.isButton()) return;
     const id = interaction.customId;
 
+    // Initialize buffer maps if they don't exist
+    client._fetchBuffers = client._fetchBuffers || new Map();
+    client._mgBuffers    = client._mgBuffers || new Map();
+
     // /fetch pipeline button
     if (id.startsWith('fetch_pipeline_')) {
       await interaction.deferUpdate();
-      const buf = client._fetchBuffer;
+      const ts = id.replace('fetch_pipeline_', '');
+      const buf = client._fetchBuffers.get(ts);
+
       if (!buf || !buf.links) {
         await interaction.editReply({ content: '⚠️ Link data expired. Run /fetch again.', components: [] });
         return;
@@ -680,7 +703,7 @@ function attachCommandHandler(client, config, {
         }
       }
       try { fs.unlinkSync(buf.txtPath); } catch {}
-      client._fetchBuffer = null;
+      client._fetchBuffers.delete(ts);
       await interaction.editReply({
         content: `🚀 **${queued}** links handed to pipeline! Monitor progress with \`/status\`.`,
         components: [],
@@ -691,7 +714,9 @@ function attachCommandHandler(client, config, {
     // /mg pipeline button
     if (id.startsWith('mg_pipeline_')) {
       await interaction.deferUpdate();
-      const buf = client._mgBuffer;
+      const ts = id.replace('mg_pipeline_', '');
+      const buf = client._mgBuffers.get(ts);
+
       if (!buf || !buf.lines) {
         await interaction.editReply({ content: '⚠️ Data expired. Run /mg again.', components: [] });
         return;
@@ -706,7 +731,7 @@ function attachCommandHandler(client, config, {
         }
       }
       try { fs.unlinkSync(buf.txtPath); } catch {}
-      client._mgBuffer = null;
+      client._mgBuffers.delete(ts);
       await interaction.editReply({
         content: `🚀 **${queued}** MEGA links handed to pipeline! Monitor with \`/status\`.`,
         components: [],
@@ -717,6 +742,12 @@ function attachCommandHandler(client, config, {
     // /mg download-only button (just dismiss the buttons)
     if (id.startsWith('mg_download_')) {
       await interaction.deferUpdate();
+      const ts = id.replace('mg_download_', '');
+      const buf = client._mgBuffers.get(ts);
+      if (buf) {
+        try { fs.unlinkSync(buf.txtPath); } catch {}
+        client._mgBuffers.delete(ts);
+      }
       await interaction.editReply({ content: '✅ .txt file sent above. Buttons dismissed.', components: [] });
       return;
     }
