@@ -159,6 +159,28 @@ async function encryptFileAsZip(rawFilePath, outputZipPath, password) {
 }
 
 // ─── Per-link pipeline ────────────────────────────────────────────────────────
+
+// Guild channel name cache — populated once per run to avoid 500+ API fetches
+let _guildChannelNames = null; // Set<string> of lowercase channel names
+
+async function buildGuildChannelCache(config) {
+  if (_guildChannelNames !== null) return; // already populated
+  try {
+    const botClient = await getClient(config);
+    const guild     = await botClient.guilds.fetch(config.guildId);
+    await guild.channels.fetch(); // populate cache
+    _guildChannelNames = new Set(
+      guild.channels.cache
+        .filter(ch => ch.type === 0) // ChannelType.GuildText = 0
+        .map(ch => ch.name.toLowerCase())
+    );
+    console.log(`[mirrorEngine] Channel cache built: ${_guildChannelNames.size} text channel(s) in target guild.`);
+  } catch (err) {
+    console.warn(`[mirrorEngine] Could not build channel cache: ${err.message}`);
+    _guildChannelNames = new Set(); // empty set — dedup check will just skip (safe)
+  }
+}
+
 async function processLink(entry, config) {
   const { link, name, categoryName } = entry;
   const mc = config.mirrorEngine;
@@ -170,42 +192,20 @@ async function processLink(entry, config) {
   fs.mkdirSync(tmpDir, { recursive: true });
 
   // ── 0. Discord deduplication check (survives state loss) ─────────────────
-  // Before spending time downloading/encrypting, check if the target guild
-  // already has a channel for this file that contains a delivered message.
-  // This makes restarts safe even without a persistent state file.
+  // If the target guild already has a channel with this file's name, the file
+  // was already delivered — skip the entire download/encrypt/upload pipeline.
+  // Channel name is the ground truth: it only exists if the bot created it.
   try {
-    const botClient = await getClient(config);
-    const guild     = await botClient.guilds.fetch(config.guildId);
-    await guild.channels.fetch();
-
     const { buildChannelName } = require('../unicodeFormatter');
-    const expectedChName = buildChannelName(name, config);
+    const expectedChName = buildChannelName(name, config).toLowerCase();
 
-    const existingCh = guild.channels.cache.find(
-      (ch) => ch.name.toLowerCase() === expectedChName.toLowerCase()
-    );
-
-    if (existingCh) {
-      // Channel already exists — check if it has any messages (i.e. already delivered)
-      try {
-        const msgs = await existingCh.messages.fetch({ limit: 5 });
-        if (msgs.size > 0) {
-          // Already delivered — mark done and skip the whole pipeline
-          const firstMsg = msgs.first();
-          setEntry(link, {
-            status:    'done',
-            channelId: existingCh.id,
-            messageId: firstMsg?.id || null,
-            error:     null,
-          });
-          console.log(`[mirrorEngine] ⏭ Already delivered: ${name} — skipping.`);
-          safeDelete(tmpDir);
-          return;
-        }
-      } catch { /* can't fetch messages — proceed normally */ }
+    if (_guildChannelNames !== null && _guildChannelNames.has(expectedChName)) {
+      setEntry(link, { status: 'done', error: null });
+      console.log(`[mirrorEngine] ⏭ Skip (channel exists): ${name}`);
+      safeDelete(tmpDir);
+      return;
     }
   } catch (preCheckErr) {
-    // Pre-check is best-effort; don't block the pipeline if it fails
     console.warn(`[mirrorEngine] Pre-check warning for "${name}": ${preCheckErr.message}`);
   }
 
@@ -564,6 +564,9 @@ async function runEngine(config) {
   const mc          = config.mirrorEngine;
   const concurrency = Math.max(1, mc.concurrency || 2);
 
+  // Reset channel name cache so it gets rebuilt fresh each run
+  _guildChannelNames = null;
+
   // ── Phase 1: Scan ────────────────────────────────────────────────────────
   console.log('[mirrorEngine] ── Phase 1: Scanning for MEGA links...');
   const found = await scanAllGuilds(config, _selfbot);
@@ -587,6 +590,12 @@ async function runEngine(config) {
     console.log('[mirrorEngine] Nothing to do — all links processed.');
     return;
   }
+
+  // ── Phase 1.5: Build channel dedup cache ─────────────────────────────────
+  // Fetch ALL channels in target guild ONCE — shared by all concurrent workers.
+  // Any link whose channel name already exists in the guild is skipped instantly.
+  console.log('[mirrorEngine] Building channel dedup cache from target guild...');
+  await buildGuildChannelCache(config);
 
   // ── Phase 2: Process ──────────────────────────────────────────────────────
   console.log(`[mirrorEngine] ── Phase 2: Processing ${pending.length} link(s) (concurrency=${concurrency})...`);
