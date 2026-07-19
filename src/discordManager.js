@@ -2,46 +2,41 @@ const { PermissionsBitField, ChannelType } = require('discord.js');
 const { getClient } = require('./discordClient');
 const { buildChannelName } = require('./unicodeFormatter');
 
-// In-memory cache: categoryName (lowercase) → category channel ID
-// Avoids repeated API lookups within one run.
-const categoryCache = new Map();
-
 /**
- * Finds an existing category in the guild by name (case-insensitive),
- * or creates a new one. Results are cached in-memory.
+ * Finds an existing category by name (case-insensitive) that has space
+ * (less than 50 text channels), or creates a new category with the exact same name.
+ * Multiple categories can have the same name in Discord.
  */
 async function findOrCreateCategory(guild, categoryName) {
-  const key = categoryName.toLowerCase();
-  if (categoryCache.has(key)) {
-    try {
-      const cached = await guild.channels.fetch(categoryCache.get(key));
-      if (cached) return cached;
-    } catch {
-      categoryCache.delete(key);
-    }
-  }
+  const DISCORD_CATEGORY_LIMIT = 50;
 
   // Search existing categories
   await guild.channels.fetch();
-  const existing = guild.channels.cache.find(
-    (ch) =>
-      ch.type === ChannelType.GuildCategory &&
-      ch.name.toLowerCase() === key
+
+  const key = categoryName.toLowerCase();
+  // Filter for categories with the same name (case-insensitive)
+  const matchingCats = [...guild.channels.cache.values()].filter(
+    (ch) => ch.type === ChannelType.GuildCategory && ch.name.toLowerCase() === key
   );
 
-  if (existing) {
-    categoryCache.set(key, existing.id);
-    console.log(`[discordManager] Using existing category: ${existing.name}`);
-    return existing;
+  // Look for one that has space
+  for (const cat of matchingCats) {
+    const textChannelsCount = guild.channels.cache.filter(
+      (ch) => ch.parentId === cat.id && ch.type === ChannelType.GuildText
+    ).size;
+
+    if (textChannelsCount < DISCORD_CATEGORY_LIMIT) {
+      console.log(`[discordManager] Using category "${cat.name}" (${textChannelsCount}/${DISCORD_CATEGORY_LIMIT} channels)`);
+      return cat;
+    }
   }
 
-  // Create the category
+  // If all matching categories are full or none exist, create a new one with the exact same name
   const created = await guild.channels.create({
     name: categoryName,
     type: ChannelType.GuildCategory,
   });
-  categoryCache.set(key, created.id);
-  console.log(`[discordManager] Created new category: ${created.name}`);
+  console.log(`[discordManager] Created new category: "${created.name}" (all previous were full or none existed)`);
   return created;
 }
 
@@ -194,27 +189,17 @@ async function createZipChannelOnce(zipBaseName, config, options = {}) {
 
       if (!isFull) throw err; // bubble up non-overflow errors
 
-      // Category is full — find or create the next overflow sibling.
-      // Base name = sourceCategoryName (exact mirror) or resolved default category name.
-      console.warn(`[discordManager] Category full (attempt ${overflowAttempt + 1}) — looking for overflow...`);
+      // Category is full — find or create a sibling category with the exact same name.
+      console.warn(`[discordManager] Category full (attempt ${overflowAttempt + 1}) — looking for space/overflow...`);
       await guild.channels.fetch();
 
       const baseName = resolvedCategoryName || 'Uploads';
-      const n = overflowAttempt + 2; // (2), (3), ...
-      const overflowName = `${baseName} (${n})`;
-
-      let overflowCat = guild.channels.cache.find(
-        (ch) => ch.type === ChannelType.GuildCategory && ch.name === overflowName
-      );
-      if (!overflowCat) {
-        overflowCat = await guild.channels.create({
-          name: overflowName,
-          type: ChannelType.GuildCategory,
-        });
-        console.log(`[discordManager] Created overflow category: ${overflowName}`);
-        categoryCache.set(overflowName.toLowerCase(), overflowCat.id);
+      try {
+        const cat = await findOrCreateCategory(guild, baseName);
+        parentId = cat.id;
+      } catch (catErr) {
+        throw new Error(`Failed to find or create category "${baseName}": ${catErr.message}`);
       }
-      parentId = overflowCat.id;
     }
   }
 
