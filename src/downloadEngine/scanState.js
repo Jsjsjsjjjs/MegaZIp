@@ -39,9 +39,15 @@ function markLinkProcessed(link, info = {}) {
   db.set(['processedLinks', link], { ...info, processedAt: new Date().toISOString() }).write();
 }
 
+function resetScanState() {
+  db.set('channels', {}).write();
+  db.set('processedLinks', {}).write();
+}
+
 module.exports = {
   getChannelScanState,
   updateChannelScanState,
   isLinkProcessed,
   markLinkProcessed,
+  resetScanState,
 };

@@ -1,47 +1,41 @@
-'use strict';
-
-const fs   = require('fs');
+const fs = require('fs');
 const path = require('path');
 const { Storage } = require('megajs');
 
-// ── Session persistence ────────────────────────────────────────────────────────
-// Saves the MEGA session token to disk after a fresh login.
-// On the next start we resume the existing session instead of doing a brand-new
-// email+password login, which prevents MEGA from flagging each Railway restart
-// as a "suspicious login from a foreign IP".
-// Fall back to /tmp if config folder is read-only on hosting (Railway).
-function resolveSessionPath() {
-  const preferred = path.join(__dirname, '..', 'config', 'mega-session.json');
+// Write the session token to a persistent path in /tmp on read-only hosts
+const SESSION_PATH = (() => {
+  const preferred = path.join(__dirname, '..', 'config', 'mega-session.txt');
   try {
-    fs.accessSync(path.dirname(preferred), fs.constants.W_OK);
+    fs.mkdirSync(path.dirname(preferred), { recursive: true });
+    fs.writeFileSync(preferred, '');
+    fs.unlinkSync(preferred);
     return preferred;
   } catch {
-    return path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'mega-session-tmp.json');
+    return path.join(process.env.TMPDIR || process.env.TEMP || '/tmp', 'mega-session.txt');
   }
-}
-
-const SESSION_PATH    = resolveSessionPath();
-const SESSION_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // 30 days in ms
+})();
 
 function loadSavedSession() {
-  try {
-    const raw  = fs.readFileSync(SESSION_PATH, 'utf8');
-    const data = JSON.parse(raw);
-    if (data.sid && Date.now() - (data.savedAt || 0) < SESSION_MAX_AGE) {
-      return data.sid;
+  if (fs.existsSync(SESSION_PATH)) {
+    try {
+      const token = fs.readFileSync(SESSION_PATH, 'utf8').trim();
+      return token || null;
+    } catch {
+      return null;
     }
-  } catch { /* no saved session or parse error — fall through */ }
+  }
   return null;
 }
 
 function persistSession(storage) {
   try {
-    const sid = storage.sid;
-    if (!sid) return;
-    fs.writeFileSync(SESSION_PATH, JSON.stringify({ sid, savedAt: Date.now() }), 'utf8');
-    console.log('[megaUploader] MEGA session token saved — future restarts will reuse it.');
-  } catch (e) {
-    console.warn('[megaUploader] Could not persist MEGA session:', e.message);
+    const session = storage.exportSession();
+    if (session && typeof session === 'string') {
+      fs.writeFileSync(SESSION_PATH, session, 'utf8');
+      console.log('[megaUploader] Persisted MEGA session token.');
+    }
+  } catch (err) {
+    console.warn(`[megaUploader] Could not save session token: ${err.message}`);
   }
 }
 
@@ -52,7 +46,7 @@ function clearSavedSession() {
 // ── Storage singleton ──────────────────────────────────────────────────────────
 let storagePromise = null;
 
-// How long to wait for a single upload before giving up (15 min — MEGA free tier is slow)
+// How long to wait for a single upload before giving up (15 minutes — MEGA free tier is slow)
 const UPLOAD_TIMEOUT_MS = 15 * 60 * 1000;
 
 /**
@@ -107,7 +101,7 @@ function _createStorage(config, tryResume) {
 
       // If the saved session is stale/invalid, discard it and retry with credentials
       if (savedSid) {
-        console.warn('[megaUploader] Saved session rejected — falling back to fresh login.');
+        console.warn('[megaUploader] Saved session token rejected — falling back to fresh login.');
         clearSavedSession();
         storagePromise = null;
         // Recurse without tryResume so we do a proper email/password login

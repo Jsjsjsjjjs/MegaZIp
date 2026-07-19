@@ -67,6 +67,25 @@ function toStylizedBold(text) {
   return result;
 }
 
+function buildChannelName(zipBaseName, config = {}) {
+  // Normalize spaces/underscores to hyphens (Discord channel naming convention)
+  let name = zipBaseName.replace(/[\s_]+/g, '-');
+
+  if (config.channelNameBoldStyle) {
+    name = toStylizedBold(name);
+  }
+
+  // Wrap in a decorative template, e.g. "『🎐』|{name}" -> "『🎐』|My-Zip"
+  const template = config.channelNameTemplate || '{name}';
+  let fullName = template.replace('{name}', name);
+
+  if (fullName.length > MAX_CHANNEL_NAME_LENGTH) {
+    fullName = safeTruncate(fullName, MAX_CHANNEL_NAME_LENGTH);
+  }
+
+  return fullName;
+}
+
 function fromStylizedBold(stylizedText) {
   if (!stylizedText) return '';
   let result = '';
@@ -87,25 +106,6 @@ function fromStylizedBold(stylizedText) {
     }
   }
   return result;
-}
-
-function buildChannelName(zipBaseName, config = {}) {
-  // Normalize spaces/underscores to hyphens (Discord channel naming convention)
-  let name = zipBaseName.replace(/[\s_]+/g, '-');
-
-  if (config.channelNameBoldStyle) {
-    name = toStylizedBold(name);
-  }
-
-  // Wrap in a decorative template, e.g. "『🎐』|{name}" -> "『🎐』|My-Zip"
-  const template = config.channelNameTemplate || '{name}';
-  let fullName = template.replace('{name}', name);
-
-  if (fullName.length > MAX_CHANNEL_NAME_LENGTH) {
-    fullName = safeTruncate(fullName, MAX_CHANNEL_NAME_LENGTH);
-  }
-
-  return fullName;
 }
 
 module.exports = { toStylizedBold, fromStylizedBold, buildChannelName };

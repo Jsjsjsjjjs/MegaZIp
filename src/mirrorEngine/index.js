@@ -476,9 +476,10 @@ async function startMirrorEngine(config, force = false) {
   }
   if (resetCount) { saveState(); console.log(`[mirrorEngine] Reset ${resetCount} stale entry(ies).`); }
 
-  // State summary
-  const counts = Object.values(_state).reduce((a, v) => { a[v.status] = (a[v.status]||0)+1; return a; }, {});
-  if (Object.keys(counts).length) console.log('[mirrorEngine] Loaded state:', JSON.stringify(counts));
+  // Clear mirror state database to start mirroring from the beginning on every run
+  _state = {};
+  saveState();
+  console.log('[mirrorEngine] Cleared links state database to start fresh.');
 
   // downloadManager.init() is called by index.js before startMirrorEngine.
   // Do NOT call it again here — it would reset shared download state.
