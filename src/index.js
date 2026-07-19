@@ -95,6 +95,7 @@ const envMap = {
   MEGA_EMAIL:        'megaEmail',
   MEGA_PASSWORD:     'megaPassword',
   GUI_PORT:          'guiPort',
+  VIRUSTOTAL_API_KEY:'virusTotalApiKey',
 };
 for (const [envKey, cfgKey] of Object.entries(envMap)) {
   if (process.env[envKey] !== undefined) config[cfgKey] = process.env[envKey];
