@@ -47,11 +47,11 @@ if (fs.existsSync(envFilePath)) {
 const { watchFolder }    = require('./folderWatcher');
 const { encryptZip }     = require('./zipEncryptor');
 const { uploadToMega }   = require('./megaUploader');
-const { createZipChannel, addToBatch } = require('./discordManager');
+const { createZipChannel, addToBatch, shrinkMinimal } = require('./discordManager');
 const { sendZipMessage } = require('./webhookSender');
 const { getClient }      = require('./discordClient');
 const { registerCommands, attachCommandHandler } = require('./commandHandler');
-const { updateState, getState, getAllStates, appendLog, removeState } = require('./stateStore');
+const { updateState, getState, getAllStates, appendLog, removeState, getBatchState, setBatchState } = require('./stateStore');
 const { startGuiServer } = require('./gui/server');
 const { startDownloadEngine, pauseDownloads, resumeDownloads, cancelDownloads } = require('./downloadEngine');
 const downloadManager    = require('./downloadEngine/downloadManager');
@@ -535,6 +535,13 @@ async function main() {
           getStatus: () => ({ active: activeCount, queued: queue.length }),
         },
         onIngestLink: downloadAndIngest,
+        shrinkControls: {
+          shrink: async (n) => {
+            const guild = await client.guilds.fetch(config.guildId);
+            await guild.channels.fetch();
+            return shrinkMinimal(guild, config, n);
+          },
+        },
       });
       console.log('[index] Slash commands registered.');
     } catch (err) {

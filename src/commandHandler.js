@@ -165,6 +165,40 @@ async function registerCommands(config) {
       .setName('mg')
       .setDescription('List all files in your MEGA account and export as .txt (owner only)')
       .toJSON(),
+
+    // ── /shrink — Manually collapse individual channels into batch embeds ──────
+    new SlashCommandBuilder()
+      .setName('shrink')
+      .setDescription('Collapse individual link channels into batch embeds (owner only)')
+      .addIntegerOption(o =>
+        o.setName('count')
+          .setDescription('How many channels to shrink (default: 1)')
+          .setMinValue(1)
+          .setMaxValue(50)
+          .setRequired(false)
+      )
+      .toJSON(),
+
+    // ── /editembed — Edit batch embed template ────────────────────────────────
+    new SlashCommandBuilder()
+      .setName('editembed')
+      .setDescription('Customize the batch embed format (owner only)')
+      .addStringOption(o =>
+        o.setName('title')
+          .setDescription('Embed title. Use {n} for batch channel number (e.g. "Batch Links — Page {n}")')
+          .setRequired(false)
+      )
+      .addStringOption(o =>
+        o.setName('fieldformat')
+          .setDescription('Per-entry format. Variables: {name} {link} {key} {password}')
+          .setRequired(false)
+      )
+      .addStringOption(o =>
+        o.setName('color')
+          .setDescription('Embed side-bar color as hex (e.g. #5865F2)')
+          .setRequired(false)
+      )
+      .toJSON(),
   ];
 
   const rest = new REST({ version: '10' }).setToken(config.discordToken);
@@ -179,6 +213,7 @@ function attachCommandHandler(client, config, {
   mirrorControls = {},   // { getStatus, start, stop }
   pipelineControls = {}, // { pause, resume, getStatus }
   onIngestLink,
+  shrinkControls = {},   // { shrink(n) }
 } = {}) {
 
   client.on('interactionCreate', async (interaction) => {
@@ -306,7 +341,7 @@ function attachCommandHandler(client, config, {
 
     // ── /dcheck — Deduplication of whole server ───────────────────────────────
     if (cmd === 'dcheck') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply(); // PUBLIC — survives refresh
       const dryRun = interaction.options.getBoolean('dryrun') ?? false;
 
       try {
@@ -366,9 +401,9 @@ function attachCommandHandler(client, config, {
       return;
     }
 
-    // ── /check — VirusTotal scan ──────────────────────────────────────────────
+    // ── /check — VirusTotal scan ────────────────────────────────────────────────────
     if (cmd === 'check') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply(); // PUBLIC — survives refresh
       // channel option accepts: channel name, raw ID, or Discord URL like discord.com/channels/.../channelId
       const channelRaw = (interaction.options.getString('channel') || '').trim();
 
@@ -562,10 +597,8 @@ function attachCommandHandler(client, config, {
     client._fetchBuffers = client._fetchBuffers || new Map();
     client._mgBuffers    = client._mgBuffers || new Map();
 
-    // ── /fetch — Scan source server, export MEGA links as .txt ───────────────
+    // ── /fetch — Scan source server, export MEGA links as .txt ─────────────
     if (cmd === 'fetch') {
-      if (!isOwner) { await interaction.reply({ content: '🚫 Owner only.', ephemeral: true }); return; }
-
       // Conflict guard: do not fetch if mirror engine is currently running
       const mirrorStatus = mirrorControls.getStatus?.() || { running: false };
       if (mirrorStatus.running) {
@@ -620,7 +653,6 @@ function attachCommandHandler(client, config, {
 
     // ── /mg — List MEGA account files, export as .txt ──────────────────────────
     if (cmd === 'mg') {
-      if (!isOwner) { await interaction.reply({ content: '🚫 Owner only.', ephemeral: true }); return; }
       await interaction.deferReply({ ephemeral: true });
 
       try {
@@ -673,6 +705,91 @@ function attachCommandHandler(client, config, {
       } catch (err) {
         await interaction.editReply({ content: `❌ Error: ${err.message}` });
       }
+      return;
+    }
+
+    // ── /shrink — Manually collapse channels south-to-north into batch embeds ──
+    if (cmd === 'shrink') {
+      const count = interaction.options.getInteger('count') ?? 1;
+      await interaction.deferReply({ ephemeral: true });
+      try {
+        if (!shrinkControls.shrink) {
+          await interaction.editReply({ content: '⚠️ Shrink control not available.' });
+          return;
+        }
+        await interaction.editReply({ content: `🔃 Shrinking **${count}** channel(s) (south-to-north)...` });
+        const { shrunk, details } = await shrinkControls.shrink(count);
+        const summary = details.slice(0, 20).join('\n');
+        const extra   = details.length > 20 ? `\n…and ${details.length - 20} more` : '';
+        await interaction.editReply({
+          content: `🗜️ **Shrink complete!** Collapsed: **${shrunk}/${count}** channel(s)\n${summary}${extra}`,
+        });
+      } catch (err) {
+        await interaction.editReply({ content: `❌ Error: ${err.message}` });
+      }
+      return;
+    }
+
+    // ── /editembed — Edit batch embed template ────────────────────────────────
+    if (cmd === 'editembed') {
+      const newTitle  = interaction.options.getString('title');
+      const newFormat = interaction.options.getString('fieldformat');
+      const newColor  = interaction.options.getString('color');
+
+      if (!newTitle && !newFormat && !newColor) {
+        // Show current settings
+        const tpl = config.batchEmbedTemplate || {};
+        await interaction.reply({
+          content: [
+            '📄 **Current batch embed template:**',
+            `\`title\` : ${tpl.title || '*(default)*'}`,
+            `\`fieldformat\` : ${tpl.fieldformat || '*(default)*'}`,
+            `\`color\` : ${tpl.color || '#5865F2 (default)'}`,
+            '',
+            '**Default format:**',
+            '```',
+            '**{name}**',
+            '{link} | {key}',
+            '```',
+          ].join('\n'),
+          ephemeral: true,
+        });
+        return;
+      }
+
+      // Apply updates
+      if (!config.batchEmbedTemplate) config.batchEmbedTemplate = {};
+      if (newTitle)  config.batchEmbedTemplate.title       = newTitle;
+      if (newFormat) config.batchEmbedTemplate.fieldformat = newFormat;
+      if (newColor)  config.batchEmbedTemplate.color       = newColor;
+
+      try { fs.writeFileSync(configPath, JSON.stringify(config, null, 2)); } catch {}
+
+      // Show a live preview embed
+      const { EmbedBuilder } = require('discord.js');
+      const tpl    = config.batchEmbedTemplate;
+      const title  = (tpl.title || 'Batch Links — Page {n}').replace('{n}', '1');
+      const fmt    = tpl.fieldformat || '**{name}**\n{link} | {key}';
+      const color  = parseInt((tpl.color || '#5865F2').replace('#', ''), 16);
+      const demoLink = 'https://mega.co.nz/#!ExAmPlE!demoKey123';
+      const demoKey  = 'demoKey123';
+      const preview  = fmt
+        .replace('{name}',     'Example Tool Name')
+        .replace('{link}',     demoLink)
+        .replace('{key}',      demoKey)
+        .replace('{password}', 'pass123');
+
+      const previewEmbed = new EmbedBuilder()
+        .setTitle(title)
+        .setColor(color)
+        .addFields({ name: '\u200b', value: preview.slice(0, 1024), inline: false })
+        .setFooter({ text: 'Preview — real entries will look like this' });
+
+      await interaction.reply({
+        content: '✅ **Batch embed template updated!** Preview:',
+        embeds: [previewEmbed],
+        ephemeral: true,
+      });
       return;
     }
   });

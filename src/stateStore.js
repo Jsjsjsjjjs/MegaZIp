@@ -28,7 +28,12 @@ const dbPath  = resolveStatePath();
 const adapter = new FileSync(dbPath);
 const db      = low(adapter);
 
-db.defaults({ files: {}, logs: [] }).write();
+db.defaults({ files: {}, logs: [], batchState: {
+  dchecksRun: 0,
+  currentBatchChannelId: null,
+  currentLinkCount: 0,
+  batchSeriesNumber: 0,
+} }).write();
 
 const emitter = new EventEmitter();
 // Increase max listeners to avoid spurious warnings when many pipeline workers attach
@@ -91,4 +96,16 @@ function clearLogs() {
   emitter.emit('logs-cleared');
 }
 
-module.exports = { getState, updateState, getAllStates, removeState, appendLog, getLogs, clearLogs, emitter };
+// ── Batch State ─────────────────────────────────────────────────────────────
+function getBatchState() {
+  return db.get('batchState').value() || {
+    dchecksRun: 0, currentBatchChannelId: null, currentLinkCount: 0, batchSeriesNumber: 0,
+  };
+}
+
+function setBatchState(updates) {
+  const current = getBatchState();
+  db.set('batchState', { ...current, ...updates }).write();
+}
+
+module.exports = { getState, updateState, getAllStates, removeState, appendLog, getLogs, clearLogs, emitter, getBatchState, setBatchState };
