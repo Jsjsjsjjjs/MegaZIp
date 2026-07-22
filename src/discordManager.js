@@ -162,41 +162,13 @@ async function findDuplicateChannels(guild, config = {}) {
   const toDelete = [];
 
   for (const group of candidateGroups) {
-    const sorted = [...group].sort((a, b) => (a.id < b.id ? -1 : 1));
-    const primaryChannel = sorted[0];
-    const primaryLinks = await getChannelMegaLinks(primaryChannel);
-    const seenLinks = new Set(primaryLinks);
-
-    for (let i = 1; i < sorted.length; i++) {
-      const ch = sorted[i];
-      const chLinks = await getChannelMegaLinks(ch);
-
-      if (chLinks.size === 0) {
-        // Channel has no MEGA link -> empty/broken channel -> candidate for cleanup
-        toDelete.push(ch);
-      } else {
-        let isDuplicate = false;
-        for (const link of chLinks) {
-          if (seenLinks.has(link)) {
-            isDuplicate = true;
-            break;
-          }
-        }
-
-        if (isDuplicate) {
-          toDelete.push(ch);
-        } else {
-          // Channel has unique link(s) -> preserve it!
-          for (const link of chLinks) {
-            seenLinks.add(link);
-          }
-        }
-      }
-    }
+    const sorted = [...group].sort((a, b) => (a.id < b.id ? -1 : 1)); // oldest first
+    toDelete.push(...sorted.slice(1)); // keep oldest, mark rest for deletion
   }
 
   return toDelete;
 }
+
 
 async function runAutoDedup(guild, config = {}) {
   const toDelete = await findDuplicateChannels(guild, config);
