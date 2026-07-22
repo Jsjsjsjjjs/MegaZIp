@@ -8,38 +8,23 @@ const os   = require('os');
 const { getAllStates }                   = require('./stateStore');
 const { editZipMessage }                 = require('./webhookSender');
 const { extractMegaLinks, flattenEmbed } = require('./downloadEngine/linkExtractor');
-const { findDuplicateChannels }          = require('./discordManager');
 
 const configPath = path.join(__dirname, '..', 'config', 'config.json');
 
 // ── Unicode bold → ASCII normaliser (for /dcheck) ────────────────────────────
-// Maps Mathematical Bold characters only.
-// ⚠️  IMPORTANT: We do NOT strip emoji, brackets, pipes, or any other characters.
-// Two channels are duplicates ONLY if after bold→ASCII conversion they are
-// character-for-character identical (case-insensitive).
-const BOLD_UNICODE_MAP = {
-  '𝗔':'A','𝗕':'B','𝗖':'C','𝗗':'D','𝗘':'E','𝗙':'F','𝗚':'G','𝗛':'H','𝗜':'I','𝗝':'J',
-  '𝗞':'K','𝗟':'L','𝗠':'M','𝗡':'N','𝗢':'O','𝗣':'P','𝗤':'Q','𝗥':'R','𝗦':'S','𝗧':'T',
-  '𝗨':'U','𝗩':'V','𝗪':'W','𝗫':'X','𝗬':'Y','𝗭':'Z',
-  '𝗮':'a','𝗯':'b','𝗰':'c','𝗱':'d','𝗲':'e','𝗳':'f','𝗴':'g','𝗵':'h','𝗶':'i','𝗷':'j',
-  '𝗸':'k','𝗹':'l','𝗺':'m','𝗻':'n','𝗼':'o','𝗽':'p','𝗾':'q','𝗿':'r','𝘀':'s','𝘁':'t',
-  '𝘂':'u','𝘃':'v','𝘄':'w','𝘅':'x','𝘆':'y','𝘇':'z',
-  '𝟬':'0','𝟭':'1','𝟮':'2','𝟯':'3','𝟰':'4','𝟱':'5','𝟲':'6','𝟳':'7','𝟴':'8','𝟵':'9',
-  '𝘼':'A','𝘽':'B','𝘾':'C','𝘿':'D','𝙀':'E','𝙁':'F','𝙂':'G','𝙃':'H','𝙄':'I','𝙅':'J',
-  '𝙆':'K','𝙇':'L','𝙈':'M','𝙉':'N','𝙊':'O','𝙋':'P','𝙌':'Q','𝙍':'R','𝙎':'S','𝙏':'T',
-  '𝙐':'U','𝙑':'V','𝙒':'W','𝙓':'X','𝙔':'Y','𝙕':'Z',
-};
-
 /**
- * Convert bold unicode → ASCII, then lowercase.
- * Does NOT strip any other characters — two channels must be truly identical
- * (modulo bold styling and letter case) to be considered duplicates.
+ * Convert any unicode styling variants (bold, italic, fullwidth, etc.) → standard ASCII, then lowercase.
  */
 function normalizeChannelName(name) {
   if (!name) return '';
-  let out = '';
-  for (const ch of name) out += BOLD_UNICODE_MAP[ch] || ch;
-  return out.toLowerCase();
+  return name.normalize('NFKD').toLowerCase().trim();
+}
+
+function getCategoryBaseKey(guild, parentId) {
+  if (!parentId) return 'root';
+  const parent = guild.channels.cache.get(parentId);
+  if (!parent) return parentId;
+  return parent.name.replace(/\s*\(\d+\)$/, '').trim().toLowerCase();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -345,9 +330,26 @@ function attachCommandHandler(client, config, {
 
       try {
         const guild = await client.guilds.fetch(config.guildId);
-        await interaction.editReply({ content: '🔍 Analyzing channels for duplicate content…' });
+        await guild.channels.fetch();
+        const textChannels = [...guild.channels.cache.values()].filter(
+          ch => ch.type === ChannelType.GuildText
+        );
 
-        const toDelete = await findDuplicateChannels(guild, config);
+        // Group by category base key + normalized channel name
+        const groups = new Map();
+        for (const ch of textChannels) {
+          const key = `${getCategoryBaseKey(guild, ch.parentId)}:${normalizeChannelName(ch.name)}`;
+          if (!groups.has(key)) groups.set(key, []);
+          groups.get(key).push(ch);
+        }
+
+        // Find groups with duplicates
+        const duplicateGroups = [...groups.values()].filter(g => g.length > 1);
+        const toDelete = [];
+        for (const group of duplicateGroups) {
+          const sorted = [...group].sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1)); // oldest first
+          toDelete.push(...sorted.slice(1)); // keep first (oldest), delete rest
+        }
 
         if (toDelete.length === 0) {
           await interaction.editReply({ content: '✅ No duplicate channels found.' });
@@ -381,7 +383,6 @@ function attachCommandHandler(client, config, {
       }
       return;
     }
-
 
     // ── /check — VirusTotal scan ────────────────────────────────────────────────────
     if (cmd === 'check') {
