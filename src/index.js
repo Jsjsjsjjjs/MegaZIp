@@ -218,9 +218,11 @@ async function _processZipInner(filename, rawZipPath, meta = {}) {
   // ── Step 1: Encrypt ──────────────────────────────────────────────────────
   let encryptedPath = state.encryptedPath;
   let password      = state.zipPassword;
+  let megaLink      = state.megaLink;
   const alreadyEncrypted = encryptedPath && fs.existsSync(encryptedPath);
 
-  if (!alreadyEncrypted) {
+  // If we already have a megaLink, skip encrypt + upload entirely (resume case)
+  if (!megaLink && !alreadyEncrypted) {
     if (!rawZipPath || !fs.existsSync(rawZipPath)) {
       console.error(`[index] Cannot process "${filename}" — source file missing.`);
       updateState(filename, { status: 'failed', error: 'Source file missing.' });
@@ -265,7 +267,7 @@ async function _processZipInner(filename, rawZipPath, meta = {}) {
   }
 
   // ── Step 2: Upload to MEGA ───────────────────────────────────────────────
-  let megaLink = state.megaLink;
+  // megaLink already read from state in Step 1
 
   if (!megaLink) {
     try {
@@ -582,8 +584,65 @@ async function main() {
 
   startDownloadEngine(config, ingestDownloadedFile);
 
+  // ── Resume incomplete pipeline items from last run ────────────────────────
+  resumeIncompleteItems();
+
   // Mirror engine is fully standalone — only start if enabled
   startMirrorEngine(config);
+}
+
+/**
+ * On startup, find all state entries that were mid-pipeline when the bot stopped.
+ * Reset them to a resumable status and re-queue if possible.
+ */
+function resumeIncompleteItems() {
+  const allStates = getAllStates() || {};
+  const RESUMABLE = ['encrypting', 'uploading', 'uploaded', 'channel_created', 'pending', 'new'];
+  let resumed = 0;
+
+  for (const [filename, state] of Object.entries(allStates)) {
+    if (!state || !RESUMABLE.includes(state.status)) continue;
+
+    // If we have an encrypted file, resume from upload step
+    if (state.encryptedPath && fs.existsSync(state.encryptedPath)) {
+      console.log(`[index] Resuming "${filename}" from encrypted file (status: ${state.status}).`);
+      updateState(filename, { status: 'pending', error: null });
+      enqueue(filename, null);
+      resumed++;
+      continue;
+    }
+
+    // If we have a megaLink already, resume from channel step
+    if (state.megaLink) {
+      console.log(`[index] Resuming "${filename}" from MEGA link (status: ${state.status}).`);
+      updateState(filename, { status: 'uploaded', error: null });
+      enqueue(filename, null);
+      resumed++;
+      continue;
+    }
+
+    // Check if source file still exists in watched/staging folders
+    let foundPath = null;
+    for (const folder of [watchFolderPath, stagingFolderPath]) {
+      const zipPath = path.join(folder, filename);
+      if (fs.existsSync(zipPath)) { foundPath = zipPath; break; }
+    }
+
+    if (foundPath) {
+      console.log(`[index] Resuming "${filename}" from source file (status: ${state.status}).`);
+      updateState(filename, { status: 'pending', error: null });
+      enqueue(filename, foundPath);
+      resumed++;
+    } else if (state.status !== 'new') {
+      // No source file and no saved artifacts — mark as failed
+      console.warn(`[index] Cannot resume "${filename}" — no source file found.`);
+      updateState(filename, { status: 'failed', error: 'Source file missing after restart.' });
+    }
+  }
+
+  if (resumed > 0) {
+    console.log(`[index] Resumed ${resumed} incomplete item(s) from previous run.`);
+  }
 }
 
 main().catch((err) => {

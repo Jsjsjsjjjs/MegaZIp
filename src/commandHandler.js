@@ -8,8 +8,6 @@ const os   = require('os');
 const { getAllStates }                   = require('./stateStore');
 const { editZipMessage }                 = require('./webhookSender');
 const { extractMegaLinks, flattenEmbed } = require('./downloadEngine/linkExtractor');
-const { downloadMegaFile }               = require('./downloadEngine/downloadManager');
-const { scanFile }                       = require('./vtScanner');
 
 const configPath = path.join(__dirname, '..', 'config', 'config.json');
 
@@ -412,6 +410,15 @@ function attachCommandHandler(client, config, {
         return;
       }
 
+      // Lazy-load: these modules may not exist (vtScanner is optional)
+      let downloadMegaFile, scanFile;
+      try { downloadMegaFile = require('./downloadEngine/downloadManager').downloadMegaFile; } catch {
+        await interaction.editReply({ content: '❌ downloadManager module not found.' }); return;
+      }
+      try { scanFile = require('./vtScanner').scanFile; } catch {
+        await interaction.editReply({ content: '❌ vtScanner module not found. Create `src/vtScanner.js` with a `scanFile` export.' }); return;
+      }
+
       try {
         const guild = await client.guilds.fetch(config.guildId);
         await guild.channels.fetch();
@@ -612,7 +619,10 @@ function attachCommandHandler(client, config, {
       await interaction.deferReply({ ephemeral: true });
 
       try {
-        const { startScan } = require('./mirrorEngine/scanner');
+        let startScan;
+        try { startScan = require('./mirrorEngine/scanner').startScan; } catch {
+          await interaction.editReply({ content: '❌ Scanner module (`mirrorEngine/scanner.js`) not found.' }); return;
+        }
         await interaction.editReply({ content: '🔍 Scanning source server for MEGA links…' });
 
         const found = await startScan(config); // returns [{link, name, categoryName}]

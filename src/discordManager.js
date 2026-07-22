@@ -36,6 +36,31 @@ const DEFAULT_BATCH_CAT    = 'Batch';
 const DEFAULT_LINKS_PER_CH = 10;
 const DEFAULT_MAX_DCHECKS  = 4;  // how many auto-dchecks before shrink kicks in
 
+// ─── Extract decryption key from any MEGA URL format ──────────────────────────
+/**
+ * Supports both URL styles:
+ *   Old:  https://mega.co.nz/#!FILE_ID!DECRYPTION_KEY
+ *   New:  https://mega.nz/file/FILE_ID#DECRYPTION_KEY
+ *         https://mega.nz/folder/ID#KEY
+ */
+function extractMegaKey(url) {
+  if (!url) return '';
+  // New-style: mega.nz/file/ID#KEY or mega.nz/folder/ID#KEY
+  const hashIdx = url.indexOf('#');
+  if (hashIdx !== -1) {
+    const afterHash = url.substring(hashIdx + 1);
+    // Old-style has #! so the key is the part after the last !
+    if (afterHash.startsWith('!')) {
+      // #!FILE_ID!KEY
+      const parts = afterHash.split('!');
+      return parts.length >= 3 ? parts[2] : parts[parts.length - 1] || '';
+    }
+    // New-style: #KEY (no !)
+    return afterHash || '';
+  }
+  return '';
+}
+
 // ─── Category helpers ─────────────────────────────────────────────────────────
 async function findOrCreateCategory(guild, categoryName) {
   const key = categoryName.toLowerCase();
@@ -55,7 +80,6 @@ async function findOrCreateCategory(guild, categoryName) {
 
   if (existing) {
     categoryCache.set(key, existing.id);
-    console.log(`[discordManager] Using existing category: ${existing.name}`);
     return existing;
   }
 
@@ -91,11 +115,6 @@ async function getGuildChannelCount(guild) {
 }
 
 // ─── Auto-dedup ───────────────────────────────────────────────────────────────
-/**
- * Runs a deduplication pass on the guild (same logic as /dcheck).
- * Returns { deleted } — number of channels removed.
- * Resets batchState.dchecksRun to 0 if any were deleted.
- */
 async function runAutoDedup(guild) {
   await guild.channels.fetch();
   const textChannels = [...guild.channels.cache.values()].filter(
@@ -112,8 +131,8 @@ async function runAutoDedup(guild) {
   const duplicateGroups = [...groups.values()].filter((g) => g.length > 1);
   const toDelete = [];
   for (const group of duplicateGroups) {
-    const sorted = [...group].sort((a, b) => (a.id < b.id ? -1 : 1)); // oldest first
-    toDelete.push(...sorted.slice(1)); // keep oldest, delete duplicates
+    const sorted = [...group].sort((a, b) => (a.id < b.id ? -1 : 1));
+    toDelete.push(...sorted.slice(1));
   }
 
   let deleted = 0;
@@ -126,55 +145,59 @@ async function runAutoDedup(guild) {
   }
 
   console.log(`[discordManager] Auto-dedup: removed ${deleted} duplicate channel(s).`);
-  if (deleted > 0) {
-    // Reset dcheck counter — the server freed space, start fresh
-    setBatchState({ dchecksRun: 0 });
-  }
-
   return { deleted };
 }
 
 // ─── Batch embed builder ──────────────────────────────────────────────────────
 /**
- * Builds a Discord embed for a batch channel from the stored entries.
- * Template variables: {name} {link} {key} {password}
+ * Builds a Discord embed from a list of { name, link } entries.
+ * Uses extractMegaKey() so both old and new MEGA URL formats work correctly.
  */
 function buildBatchEmbed(entries, config, channelNumber) {
   const tpl    = config.batchEmbedTemplate || {};
-  const title  = tpl.title       || `Batch Links — Page ${channelNumber}`;
+  const title  = (tpl.title || `Batch Links — Page {n}`).replace('{n}', String(channelNumber));
   const fmt    = tpl.fieldformat || '**{name}**\n{link} | {key}';
   const color  = parseInt((tpl.color || '#5865F2').replace('#', ''), 16);
 
   const embed = new EmbedBuilder()
-    .setTitle(title.replace('{n}', String(channelNumber)))
+    .setTitle(title)
     .setColor(color);
 
+  // Deduplicate by link before building
+  const seen = new Set();
   for (const { name, link } of entries) {
-    // Extract just the key from mega link (part after the last !)
-    const key = link.split('!').pop() || '';
+    if (!link || seen.has(link)) continue;
+    seen.add(link);
+
+    const key = extractMegaKey(link);
     const text = fmt
       .replace('{name}', name || 'unnamed')
       .replace('{link}', link)
       .replace('{key}', key)
-      .replace('{password}', entries.password || '');
+      .replace('{password}', '');
     embed.addFields({ name: '\u200b', value: text.slice(0, 1024), inline: false });
   }
 
   return embed;
 }
 
+// ─── In-memory batch entry tracker ────────────────────────────────────────────
+// Tracks entries per batch channel to avoid fragile embed-parsing on re-read.
+// Key = channelId, Value = [{ name, link }]
+const _batchEntries = new Map();
+
 // ─── addToBatch ───────────────────────────────────────────────────────────────
-// Mutex to prevent concurrent writes to the same batch channel
 let _batchMutex = Promise.resolve();
 
-/**
- * Appends a name+link entry to the current open batch channel.
- * Creates a new batch channel (#N+1) when the current one is full.
- */
 async function addToBatch(guild, config, name, link) {
-  // Serialize calls via mutex
-  _batchMutex = _batchMutex.then(() => _addToBatchInner(guild, config, name, link));
-  return _batchMutex;
+  // Serialize via mutex to prevent concurrent writes
+  let result;
+  _batchMutex = _batchMutex
+    .then(() => _addToBatchInner(guild, config, name, link))
+    .then(r => { result = r; })
+    .catch(err => { console.error('[discordManager] addToBatch error:', err.message); });
+  await _batchMutex;
+  return result;
 }
 
 async function _addToBatchInner(guild, config, name, link) {
@@ -201,7 +224,7 @@ async function _addToBatchInner(guild, config, name, link) {
     const newNum  = (bs.batchSeriesNumber || 0) + 1;
     const chName  = String(newNum);
 
-    // Check if channel already exists (idempotency)
+    await guild.channels.fetch();
     let ch = guild.channels.cache.find(
       (c) => c.type === ChannelType.GuildText && c.name === chName && c.parentId === batchCat.id
     );
@@ -226,33 +249,54 @@ async function _addToBatchInner(guild, config, name, link) {
     batchChannel = ch;
     bs = { ...bs, batchSeriesNumber: newNum, currentBatchChannelId: ch.id, currentLinkCount: 0 };
     setBatchState(bs);
+    // Clear in-memory entries for new channel
+    _batchEntries.set(ch.id, []);
   }
 
-  // Read existing entries from the channel's last embed message (if any)
-  const existingEntries = [];
-  let existingMessageId = null;
-
-  try {
-    const msgs = await batchChannel.messages.fetch({ limit: 5 });
-    const embedMsg = msgs.find((m) => m.embeds && m.embeds.length > 0);
-    if (embedMsg) {
-      existingMessageId = embedMsg.id;
-      // Reconstruct entries from embed fields
-      for (const field of embedMsg.embeds[0].fields || []) {
-        // Each field value looks like "**Name**\nLink | Key"
-        const lines = field.value.split('\n');
-        if (lines.length >= 2) {
-          const rawName = lines[0].replace(/^\*\*|\*\*$/g, '');
-          const rawLink = lines[1].split(' | ')[0];
-          if (rawLink && rawLink.startsWith('http')) existingEntries.push({ name: rawName, link: rawLink });
+  // Get entries from in-memory tracker (canonical source of truth)
+  let entries = _batchEntries.get(batchChannel.id);
+  if (!entries) {
+    // First time seeing this channel (e.g. after restart) — rebuild from embed
+    entries = [];
+    try {
+      const msgs = await batchChannel.messages.fetch({ limit: 5 });
+      const embedMsg = [...msgs.values()].find((m) => m.embeds && m.embeds.length > 0);
+      if (embedMsg && embedMsg.embeds[0]) {
+        for (const field of embedMsg.embeds[0].fields || []) {
+          // Extract links from field values using the robust link extractor
+          const links = extractMegaLinks(field.value);
+          if (links.length > 0) {
+            // Try to extract name from the first line (usually **Name**)
+            const firstLine = field.value.split('\n')[0] || '';
+            const fieldName = firstLine.replace(/^\*\*|\*\*$/g, '').trim() || 'unnamed';
+            entries.push({ name: fieldName, link: links[0] });
+          }
         }
       }
-    }
-  } catch { /* ignore */ }
+    } catch { /* ignore read errors */ }
+    _batchEntries.set(batchChannel.id, entries);
+  }
 
-  const allEntries = [...existingEntries, { name, link }];
-  const seriesNum  = bs.batchSeriesNumber || 1;
-  const embed      = buildBatchEmbed(allEntries, config, seriesNum);
+  // Dedup: skip if this exact link is already in the batch
+  if (entries.some(e => e.link === link)) {
+    console.log(`[discordManager] Skipping duplicate in batch: "${name}" (${link})`);
+    return;
+  }
+
+  // Add the new entry
+  entries.push({ name, link });
+  _batchEntries.set(batchChannel.id, entries);
+
+  const seriesNum = bs.batchSeriesNumber || 1;
+  const embed     = buildBatchEmbed(entries, config, seriesNum);
+
+  // Find existing embed message to edit (or send fresh)
+  let existingMessageId = null;
+  try {
+    const msgs = await batchChannel.messages.fetch({ limit: 5 });
+    const embedMsg = [...msgs.values()].find((m) => m.embeds && m.embeds.length > 0);
+    if (embedMsg) existingMessageId = embedMsg.id;
+  } catch { /* ignore */ }
 
   try {
     if (existingMessageId) {
@@ -262,7 +306,8 @@ async function _addToBatchInner(guild, config, name, link) {
       await batchChannel.send({ embeds: [embed] });
     }
   } catch (err) {
-    // If edit fails (e.g. message deleted), post fresh
+    console.error(`[discordManager] Failed to update batch embed: ${err.message}`);
+    // Fallback: try sending fresh
     if (existingMessageId) {
       try { await batchChannel.send({ embeds: [embed] }); } catch { /* give up */ }
     }
@@ -270,49 +315,38 @@ async function _addToBatchInner(guild, config, name, link) {
 
   const newCount = bs.currentLinkCount + 1;
   setBatchState({ currentLinkCount: newCount });
-  console.log(`[discordManager] Added "${name}" to batch channel #${seriesNum} (${newCount}/${linksPerChannel})`);
+  console.log(`[discordManager] Added "${name}" to batch #${seriesNum} (${newCount}/${linksPerChannel})`);
 }
 
 // ─── Shrink (south-to-north) ──────────────────────────────────────────────────
-/**
- * Collapses exactly `needCount` individual-link channels into batch embeds.
- *
- * "South-to-north" = picks channels from the category that sits just above
- * the Batch category in Discord's sidebar (highest position number below Batch's
- * position), then works upward through categories.
- *
- * @returns {{ shrunk: number, details: string[] }}
- */
 async function shrinkMinimal(guild, config, needCount = 1) {
   await guild.channels.fetch();
 
   const batchCatName = (config.batchCategoryName || DEFAULT_BATCH_CAT).toLowerCase();
 
-  // Find the Batch category position
   const batchCat = guild.channels.cache.find(
     (ch) => ch.type === ChannelType.GuildCategory && ch.name.toLowerCase() === batchCatName
   );
   const batchPos = batchCat ? batchCat.position : Infinity;
 
-  // Collect all text channels NOT inside the Batch category, with a known parent
+  // Collect candidates: text channels NOT in Batch category, with a parent category
   const candidates = [...guild.channels.cache.values()].filter((ch) => {
     if (ch.type !== ChannelType.GuildText) return false;
     if (!ch.parentId) return false;
     const parent = guild.channels.cache.get(ch.parentId);
     if (!parent) return false;
-    if (parent.name.toLowerCase() === batchCatName) return false; // skip batch channels
-    // Only consider channels whose category is above (lower position number than) Batch
+    if (parent.name.toLowerCase() === batchCatName) return false;
     return parent.position < batchPos;
   });
 
-  // Sort: category position DESCENDING (nearest to Batch first),
-  //       then channel position ASCENDING within each category
+  // South-to-north: category position DESC (nearest to batch first),
+  // then channel position ASC within each category
   candidates.sort((a, b) => {
     const catA = guild.channels.cache.get(a.parentId);
     const catB = guild.channels.cache.get(b.parentId);
     const posA = catA?.position ?? 0;
     const posB = catB?.position ?? 0;
-    if (posB !== posA) return posB - posA; // higher position = closer to Batch (south) = first
+    if (posB !== posA) return posB - posA;
     return a.position - b.position;
   });
 
@@ -322,7 +356,6 @@ async function shrinkMinimal(guild, config, needCount = 1) {
 
   for (const ch of targets) {
     try {
-      // Read the MEGA link from the channel's messages
       const msgs = await ch.messages.fetch({ limit: 10 });
       let foundLink = null;
       let foundName = ch.name;
@@ -341,14 +374,13 @@ async function shrinkMinimal(guild, config, needCount = 1) {
       }
 
       if (!foundLink) {
-        console.warn(`[discordManager] Shrink: no MEGA link found in #${ch.name} — skipping.`);
+        console.warn(`[discordManager] Shrink: no MEGA link in #${ch.name} — skipping.`);
         details.push(`⚠️ #${ch.name}: no link found, skipped`);
         continue;
       }
 
-      // Append to batch first, then delete the channel
       await addToBatch(guild, config, foundName, foundLink);
-      await ch.delete('Shrunk into batch embed by batch manager');
+      await ch.delete('Shrunk into batch by batch manager');
       shrunk++;
       details.push(`✅ #${ch.name} → batch`);
       await new Promise((r) => setTimeout(r, 400));
@@ -357,22 +389,11 @@ async function shrinkMinimal(guild, config, needCount = 1) {
     }
   }
 
-  console.log(`[discordManager] Shrink complete: ${shrunk}/${needCount} channel(s) collapsed.`);
+  console.log(`[discordManager] Shrink: ${shrunk}/${needCount} collapsed.`);
   return { shrunk, details };
 }
 
 // ─── Channel limit relief ─────────────────────────────────────────────────────
-/**
- * Called before every channel creation.
- * Returns 'ok' if the guild has room, 'batch' if not even after all attempts.
- *
- * Strategy:
- *   1. Check guild channel count
- *   2. If < limit → 'ok'
- *   3. Run auto-dedup up to config.maxAutoDchecks (default 4) times
- *   4. If after all dchecks we're still full → shrink exactly 1 channel
- *   5. If shrink also can't help → return 'batch'
- */
 async function checkAndRelieveChannelLimit(guild, config) {
   const limit       = GUILD_CHANNEL_LIMIT;
   const maxDchecks  = config.maxAutoDchecks || DEFAULT_MAX_DCHECKS;
@@ -382,36 +403,37 @@ async function checkAndRelieveChannelLimit(guild, config) {
 
   console.log(`[discordManager] Guild at channel limit (${count}). Attempting auto-dedup...`);
 
-  let bs = getBatchState();
-  while (bs.dchecksRun < maxDchecks) {
-    const newRun = bs.dchecksRun + 1;
-    setBatchState({ dchecksRun: newRun });
-    bs = getBatchState();
-    console.log(`[discordManager] Auto-dedup run ${newRun}/${maxDchecks}...`);
-
+  // Track dchecks for this relief cycle (not globally persisted, to avoid stale counter issues)
+  for (let run = 0; run < maxDchecks; run++) {
+    console.log(`[discordManager] Auto-dedup run ${run + 1}/${maxDchecks}...`);
     const { deleted } = await runAutoDedup(guild);
+
     count = await getGuildChannelCount(guild);
     if (count < limit) {
-      console.log(`[discordManager] Auto-dedup freed space (${deleted} removed). Resuming normal mode.`);
+      console.log(`[discordManager] Auto-dedup freed space (${deleted} removed). Resuming normal.`);
       return 'ok';
     }
 
-    console.log(`[discordManager] Still at limit after dedup run ${newRun}.`);
+    // If nothing was deleted, no point repeating the same dedup
+    if (deleted === 0) {
+      console.log(`[discordManager] Dedup found nothing new to delete — skipping remaining runs.`);
+      break;
+    }
+
+    console.log(`[discordManager] Still at limit after dedup run ${run + 1}.`);
   }
 
-  // All dchecks exhausted — time to shrink
-  console.log(`[discordManager] All ${maxDchecks} auto-dchecks exhausted. Shrinking 1 channel (south-to-north)...`);
+  // All dchecks exhausted — shrink exactly 1 channel
+  console.log(`[discordManager] Dchecks exhausted. Shrinking 1 channel (south-to-north)...`);
   const { shrunk } = await shrinkMinimal(guild, config, 1);
   count = await getGuildChannelCount(guild);
 
   if (shrunk > 0 && count < limit) {
-    // Reset dcheck counter after successful shrink
-    setBatchState({ dchecksRun: 0 });
-    console.log(`[discordManager] Shrink freed 1 slot. Resuming normal mode.`);
+    console.log(`[discordManager] Shrink freed 1 slot. Resuming normal.`);
     return 'ok';
   }
 
-  console.log(`[discordManager] Shrink could not free enough space. Falling back to batch mode.`);
+  console.log(`[discordManager] Shrink could not free space. Falling back to batch mode.`);
   return 'batch';
 }
 
@@ -423,14 +445,11 @@ async function createZipChannelOnce(zipBaseName, config, options = {}) {
   const guild       = await client.guilds.fetch(config.guildId);
   const channelName = buildChannelName(zipBaseName, config);
 
-  // ── Relieve channel limit before doing anything ──────────────────────────
   const limitStatus = await checkAndRelieveChannelLimit(guild, config);
   if (limitStatus === 'batch') {
-    // Absolute fallback — return sentinel for batch mode
     return { channel: null, batchMode: true, guild };
   }
 
-  // ── Resolve parent category ───────────────────────────────────────────────
   let parentId = config.categoryId || undefined;
   let resolvedCategoryName = null;
 
@@ -450,14 +469,13 @@ async function createZipChannelOnce(zipBaseName, config, options = {}) {
     resolvedCategoryName = defaultCat?.name || null;
   }
 
-  // ── Duplicate channel guard ───────────────────────────────────────────────
+  // Duplicate channel guard
   const existing = await findExistingChannel(guild, channelName, parentId);
   if (existing) {
     console.log(`[discordManager] Reusing existing channel "${existing.name}" (${existing.id})`);
     return { channel: existing, batchMode: false, guild };
   }
 
-  // ── Build permission overwrites ───────────────────────────────────────────
   const permissionOverwrites = [{ id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] }];
   if (config.permissionRoleId) {
     permissionOverwrites.push({
@@ -466,7 +484,6 @@ async function createZipChannelOnce(zipBaseName, config, options = {}) {
     });
   }
 
-  // Try creating; if category is full, auto-overflow to sibling category
   for (let overflowAttempt = 0; overflowAttempt < 50; overflowAttempt++) {
     try {
       const channel = await guild.channels.create({
@@ -483,7 +500,7 @@ async function createZipChannelOnce(zipBaseName, config, options = {}) {
 
       if (!isFull) throw err;
 
-      console.warn(`[discordManager] Category full (attempt ${overflowAttempt + 1}) — looking for overflow...`);
+      console.warn(`[discordManager] Category full (attempt ${overflowAttempt + 1}) — overflow...`);
       await guild.channels.fetch();
       const baseName     = resolvedCategoryName || 'Uploads';
       const overflowName = `${baseName} (${overflowAttempt + 2})`;
@@ -503,12 +520,7 @@ async function createZipChannelOnce(zipBaseName, config, options = {}) {
   throw new Error('Could not find any available category after 50 overflow attempts.');
 }
 
-// ─── Public: createZipChannel (with rate-limit retry) ────────────────────────
-/**
- * Creates (or reuses) a Discord text channel for the given zip name.
- * Always returns { channel, batchMode, guild }.
- * batchMode=true means the guild was full even after all relief attempts.
- */
+// ─── Public: createZipChannel ────────────────────────────────────────────────
 async function createZipChannel(zipBaseName, config, options = {}, maxRetries = 3) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
