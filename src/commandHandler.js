@@ -8,6 +8,7 @@ const os   = require('os');
 const { getAllStates }                   = require('./stateStore');
 const { editZipMessage }                 = require('./webhookSender');
 const { extractMegaLinks, flattenEmbed } = require('./downloadEngine/linkExtractor');
+const { findDuplicateChannels }          = require('./discordManager');
 
 const configPath = path.join(__dirname, '..', 'config', 'config.json');
 
@@ -344,27 +345,9 @@ function attachCommandHandler(client, config, {
 
       try {
         const guild = await client.guilds.fetch(config.guildId);
-        await guild.channels.fetch();
-        const textChannels = [...guild.channels.cache.values()].filter(
-          ch => ch.type === ChannelType.GuildText
-        );
+        await interaction.editReply({ content: '🔍 Analyzing channels for duplicate content…' });
 
-        // Group by normalized name
-        const groups = new Map();
-        for (const ch of textChannels) {
-          const key = normalizeChannelName(ch.name);
-          if (!groups.has(key)) groups.set(key, []);
-          groups.get(key).push(ch);
-        }
-
-        // Find groups with duplicates
-        // Sort by snowflake ID (string compare works because IDs are fixed-length)
-        const duplicateGroups = [...groups.values()].filter(g => g.length > 1);
-        const toDelete = [];
-        for (const group of duplicateGroups) {
-          const sorted = [...group].sort((a, b) => (a.id < b.id ? -1 : 1)); // oldest first
-          toDelete.push(...sorted.slice(1)); // keep first (oldest), delete rest
-        }
+        const toDelete = await findDuplicateChannels(guild, config);
 
         if (toDelete.length === 0) {
           await interaction.editReply({ content: '✅ No duplicate channels found.' });
@@ -398,6 +381,7 @@ function attachCommandHandler(client, config, {
       }
       return;
     }
+
 
     // ── /check — VirusTotal scan ────────────────────────────────────────────────────
     if (cmd === 'check') {

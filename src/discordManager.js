@@ -10,23 +10,24 @@ const { extractMegaLinks, flattenEmbed } = require('./downloadEngine/linkExtract
 const categoryCache = new Map();
 
 // ─── Dedup helpers ────────────────────────────────────────────────────────────
-const BOLD_UNICODE_MAP = {
-  '𝗔':'A','𝗕':'B','𝗖':'C','𝗗':'D','𝗘':'E','𝗙':'F','𝗚':'G','𝗛':'H','𝗜':'I','𝗝':'J',
-  '𝗞':'K','𝗟':'L','𝗠':'M','𝗡':'N','𝗢':'O','𝗣':'P','𝗤':'Q','𝗥':'R','𝗦':'S','𝗧':'T',
-  '𝗨':'U','𝗩':'V','𝗪':'W','𝗫':'X','𝗬':'Y','𝗭':'Z',
-  '𝗮':'a','𝗯':'b','𝗰':'c','𝗱':'d','𝗲':'e','𝗳':'f','𝗴':'g','𝗵':'h','𝗶':'i','𝗷':'j',
-  '𝗸':'k','𝗹':'l','𝗺':'m','𝗻':'n','𝗼':'o','𝗽':'p','𝗾':'q','𝗿':'r','𝘀':'s','𝘁':'t',
-  '𝘂':'u','𝘃':'v','𝘄':'w','𝘅':'x','𝘆':'y','𝘇':'z',
-  '𝟬':'0','𝟭':'1','𝟮':'2','𝟯':'3','𝟰':'4','𝟱':'5','𝟲':'6','𝟳':'7','𝟴':'8','𝟵':'9',
-  '𝘼':'A','𝘽':'B','𝘾':'C','𝘿':'D','𝙀':'E','𝙁':'F','𝙂':'G','𝙃':'H','𝙄':'I','𝙅':'J',
-  '𝙆':'K','𝙇':'L','𝙈':'M','𝙉':'N','𝙊':'O','𝙋':'P','𝙌':'Q','𝙍':'R','𝙎':'S','𝙏':'T',
-  '𝙐':'U','𝙑':'V','𝙒':'W','𝙓':'X','𝙔':'Y','𝙕':'Z',
-};
-
 function normalizeName(name) {
   if (!name) return '';
   let out = '';
-  for (const ch of name) out += BOLD_UNICODE_MAP[ch] || ch;
+  for (const ch of name) {
+    const cp = ch.codePointAt(0);
+    // Mathematical Serif Bold (U+1D400 - U+1D433, U+1D7CE - U+1D7D7)
+    if (cp >= 0x1D400 && cp <= 0x1D419) { out += String.fromCharCode(65 + (cp - 0x1D400)); }
+    else if (cp >= 0x1D41A && cp <= 0x1D433) { out += String.fromCharCode(97 + (cp - 0x1D41A)); }
+    else if (cp >= 0x1D7CE && cp <= 0x1D7D7) { out += String.fromCharCode(48 + (cp - 0x1D7CE)); }
+    // Mathematical Sans-Serif Bold (U+1D5D4 - U+1D607, U+1D7EC - U+1D7F5)
+    else if (cp >= 0x1D5D4 && cp <= 0x1D5ED) { out += String.fromCharCode(65 + (cp - 0x1D5D4)); }
+    else if (cp >= 0x1D5EE && cp <= 0x1D607) { out += String.fromCharCode(97 + (cp - 0x1D5EE)); }
+    else if (cp >= 0x1D7EC && cp <= 0x1D7F5) { out += String.fromCharCode(48 + (cp - 0x1D7EC)); }
+    // Mathematical Sans-Serif Bold Italic (U+1D63C - U+1D66F)
+    else if (cp >= 0x1D63C && cp <= 0x1D655) { out += String.fromCharCode(65 + (cp - 0x1D63C)); }
+    else if (cp >= 0x1D656 && cp <= 0x1D66F) { out += String.fromCharCode(97 + (cp - 0x1D656)); }
+    else { out += ch; }
+  }
   return out.toLowerCase();
 }
 
@@ -115,11 +116,40 @@ async function getGuildChannelCount(guild) {
 }
 
 // ─── Auto-dedup ───────────────────────────────────────────────────────────────
-async function runAutoDedup(guild) {
+async function getChannelMegaLinks(channel) {
+  const links = new Set();
+  try {
+    const msgs = await channel.messages.fetch({ limit: 10 });
+    for (const msg of msgs.values()) {
+      const texts = [msg.content || ''];
+      if (msg.embeds) {
+        for (const e of msg.embeds) {
+          const ef = flattenEmbed(e);
+          if (ef) texts.push(ef);
+        }
+      }
+      for (const text of texts) {
+        for (const link of extractMegaLinks(text)) {
+          links.add(link);
+        }
+      }
+    }
+  } catch { /* skip inaccessible */ }
+  return links;
+}
+
+async function findDuplicateChannels(guild, config = {}) {
   await guild.channels.fetch();
-  const textChannels = [...guild.channels.cache.values()].filter(
-    (ch) => ch.type === ChannelType.GuildText
-  );
+  const batchCatName = (config.batchCategoryName || DEFAULT_BATCH_CAT).toLowerCase();
+
+  // Exclude channels in the Batch category
+  const textChannels = [...guild.channels.cache.values()].filter((ch) => {
+    if (ch.type !== ChannelType.GuildText) return false;
+    if (!ch.parentId) return true;
+    const parent = guild.channels.cache.get(ch.parentId);
+    if (!parent) return true;
+    return parent.name.toLowerCase() !== batchCatName;
+  });
 
   const groups = new Map();
   for (const ch of textChannels) {
@@ -128,12 +158,48 @@ async function runAutoDedup(guild) {
     groups.get(key).push(ch);
   }
 
-  const duplicateGroups = [...groups.values()].filter((g) => g.length > 1);
+  const candidateGroups = [...groups.values()].filter((g) => g.length > 1);
   const toDelete = [];
-  for (const group of duplicateGroups) {
+
+  for (const group of candidateGroups) {
     const sorted = [...group].sort((a, b) => (a.id < b.id ? -1 : 1));
-    toDelete.push(...sorted.slice(1));
+    const primaryChannel = sorted[0];
+    const primaryLinks = await getChannelMegaLinks(primaryChannel);
+    const seenLinks = new Set(primaryLinks);
+
+    for (let i = 1; i < sorted.length; i++) {
+      const ch = sorted[i];
+      const chLinks = await getChannelMegaLinks(ch);
+
+      if (chLinks.size === 0) {
+        // Channel has no MEGA link -> empty/broken channel -> candidate for cleanup
+        toDelete.push(ch);
+      } else {
+        let isDuplicate = false;
+        for (const link of chLinks) {
+          if (seenLinks.has(link)) {
+            isDuplicate = true;
+            break;
+          }
+        }
+
+        if (isDuplicate) {
+          toDelete.push(ch);
+        } else {
+          // Channel has unique link(s) -> preserve it!
+          for (const link of chLinks) {
+            seenLinks.add(link);
+          }
+        }
+      }
+    }
   }
+
+  return toDelete;
+}
+
+async function runAutoDedup(guild, config = {}) {
+  const toDelete = await findDuplicateChannels(guild, config);
 
   let deleted = 0;
   for (const ch of toDelete) {
@@ -145,8 +211,9 @@ async function runAutoDedup(guild) {
   }
 
   console.log(`[discordManager] Auto-dedup: removed ${deleted} duplicate channel(s).`);
-  return { deleted };
+  return { deleted, toDelete };
 }
+
 
 // ─── Batch embed builder ──────────────────────────────────────────────────────
 /**
@@ -538,4 +605,4 @@ async function createZipChannel(zipBaseName, config, options = {}, maxRetries = 
   }
 }
 
-module.exports = { createZipChannel, addToBatch, shrinkMinimal, runAutoDedup, buildBatchEmbed };
+module.exports = { createZipChannel, addToBatch, shrinkMinimal, runAutoDedup, findDuplicateChannels, buildBatchEmbed };
