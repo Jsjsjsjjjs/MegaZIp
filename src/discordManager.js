@@ -163,11 +163,34 @@ async function findDuplicateChannels(guild, config = {}) {
 
   for (const group of candidateGroups) {
     const sorted = [...group].sort((a, b) => (a.id < b.id ? -1 : 1)); // oldest first
-    toDelete.push(...sorted.slice(1)); // keep oldest, mark rest for deletion
+
+    const withLinks = [];
+    const withoutLinks = [];
+
+    for (const ch of sorted) {
+      const links = await getChannelMegaLinks(ch);
+      if (links.size > 0) {
+        withLinks.push(ch);
+      } else {
+        withoutLinks.push(ch);
+      }
+    }
+
+    if (withLinks.length > 0) {
+      // Always preserve the channel containing the link (oldest with-link channel)
+      // Delete all empty channels without links
+      toDelete.push(...withoutLinks);
+      // Delete extra duplicate channels that also have links
+      toDelete.push(...withLinks.slice(1));
+    } else {
+      // If no channel has a link yet, keep the oldest empty channel
+      toDelete.push(...sorted.slice(1));
+    }
   }
 
   return toDelete;
 }
+
 
 
 async function runAutoDedup(guild, config = {}) {
