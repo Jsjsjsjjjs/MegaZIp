@@ -1,11 +1,11 @@
 'use strict';
 
-const { REST, Routes, SlashCommandBuilder, ChannelType } = require('discord.js');
+const { REST, Routes, SlashCommandBuilder, ChannelType, MessageFlags } = require('discord.js');
 const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
 
-const { getAllStates }                   = require('./stateStore');
+const { getAllStates, appendSystemLog }  = require('./stateStore');
 const { editZipMessage }                 = require('./webhookSender');
 const { extractMegaLinks, flattenEmbed } = require('./downloadEngine/linkExtractor');
 
@@ -34,7 +34,7 @@ async function isOwner(interaction, config) {
 
 async function ownerOnly(interaction, config) {
   if (!(await isOwner(interaction, config))) {
-    await interaction.reply({ content: '🚫 Only the bot owner can use this command.', ephemeral: true });
+    await interaction.reply({ content: '🚫 Only the bot owner can use this command.', flags: MessageFlags.Ephemeral });
     return false;
   }
   return true;
@@ -232,7 +232,7 @@ function attachCommandHandler(client, config, {
         mirrorStatus.lastRunAt ? `Last run: ${mirrorStatus.lastRunAt}` : '',
       ].filter(Boolean);
 
-      await interaction.reply({ content: lines.join('\n'), ephemeral: true });
+      await interaction.reply({ content: lines.join('\n'), flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -242,7 +242,7 @@ function attachCommandHandler(client, config, {
       config.messageTemplate = tpl;
       try { fs.writeFileSync(configPath, JSON.stringify(config, null, 2)); } catch {}
       const warn = !tpl.includes('{link}') ? '\n⚠️ No `{link}` — the MEGA link won\'t appear in messages.' : '';
-      await interaction.reply({ content: `✅ Template updated:\n\`\`\`${tpl}\`\`\`${warn}`, ephemeral: true });
+      await interaction.reply({ content: `✅ Template updated:\n\`\`\`${tpl}\`\`\`${warn}`, flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -252,13 +252,13 @@ function attachCommandHandler(client, config, {
       config.advancedTemplate.useEmbed = !config.advancedTemplate.useEmbed;
       try { fs.writeFileSync(configPath, JSON.stringify(config, null, 2)); } catch {}
       const mode = config.advancedTemplate.useEmbed ? '🖼️ Embed' : '📝 Plain text';
-      await interaction.reply({ content: `✅ Switched to **${mode}** mode.`, ephemeral: true });
+      await interaction.reply({ content: `✅ Switched to **${mode}** mode.`, flags: MessageFlags.Ephemeral });
       return;
     }
 
     // ── /updateposts ──────────────────────────────────────────────────────────
     if (cmd === 'updateposts') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const states = getAllStates() || {};
       let updated = 0, skipped = 0, failed = 0;
 
@@ -288,24 +288,22 @@ function attachCommandHandler(client, config, {
           s.done  != null ? `Progress: **${s.done}/${s.total}**` : '',
           s.lastRunAt ? `Last run: ${s.lastRunAt}` : '',
         ].filter(Boolean);
-        await interaction.reply({ content: lines.join('\n'), ephemeral: true });
+        await interaction.reply({ content: lines.join('\n'), flags: MessageFlags.Ephemeral });
       } else if (action === 'start') {
-        if (mirrorControls.start) { mirrorControls.start(); await interaction.reply({ content: '▶️ Mirror engine starting...', ephemeral: true }); }
-        else await interaction.reply({ content: '⚠️ Mirror engine controls not available.', ephemeral: true });
+        if (mirrorControls.start) { mirrorControls.start(); await interaction.reply({ content: '▶️ Mirror engine starting...', flags: MessageFlags.Ephemeral }); }
+        else await interaction.reply({ content: '⚠️ Mirror engine controls not available.', flags: MessageFlags.Ephemeral });
       } else if (action === 'stop') {
-        if (mirrorControls.stop) { mirrorControls.stop(); await interaction.reply({ content: '⏹️ Mirror engine stopping...', ephemeral: true }); }
-        else await interaction.reply({ content: '⚠️ Mirror engine controls not available.', ephemeral: true });
+        if (mirrorControls.stop) { mirrorControls.stop(); await interaction.reply({ content: '⏹️ Mirror engine stopping...', flags: MessageFlags.Ephemeral }); }
+        else await interaction.reply({ content: '⚠️ Mirror engine controls not available.', flags: MessageFlags.Ephemeral });
       } else if (action === 'reset') {
-        // Clears mirror state so the engine re-scans from channel #1 on the next start.
-        // Use this for recovery after accidental channel deletion.
         if (mirrorControls.reset) {
           const cleared = mirrorControls.reset();
           await interaction.reply({
             content: `🔄 **Mirror state reset!** Cleared **${cleared}** tracked link(s).\nThe engine will re-scan everything from scratch on the next \`/mirror start\`.`,
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         } else {
-          await interaction.reply({ content: '⚠️ Mirror reset not available.', ephemeral: true });
+          await interaction.reply({ content: '⚠️ Mirror reset not available.', flags: MessageFlags.Ephemeral });
         }
       }
       return;
@@ -314,14 +312,15 @@ function attachCommandHandler(client, config, {
     // ── /pipeline ─────────────────────────────────────────────────────────────
     if (cmd === 'pipeline') {
       const action = interaction.options.getString('action', true);
-      if (action === 'pause')  { pipelineControls.pause?.();  await interaction.reply({ content: '⏸️ Pipeline paused.', ephemeral: true }); }
-      else if (action === 'resume') { pipelineControls.resume?.(); await interaction.reply({ content: '▶️ Pipeline resumed.', ephemeral: true }); }
+      if (action === 'pause')  { pipelineControls.pause?.();  await interaction.reply({ content: '⏸️ Pipeline paused.', flags: MessageFlags.Ephemeral }); }
+      else if (action === 'resume') { pipelineControls.resume?.(); await interaction.reply({ content: '▶️ Pipeline resumed.', flags: MessageFlags.Ephemeral }); }
       else {
         const s = pipelineControls.getStatus?.() || {};
-        await interaction.reply({ content: `📋 **Pipeline**\nActive: **${s.active || 0}** | Queued: **${s.queued || 0}**`, ephemeral: true });
+        await interaction.reply({ content: `📋 **Pipeline**\nActive: **${s.active || 0}** | Queued: **${s.queued || 0}**`, flags: MessageFlags.Ephemeral });
       }
       return;
     }
+
 
     // ── /dcheck — Deduplication of whole server ───────────────────────────────
     if (cmd === 'dcheck') {
@@ -387,8 +386,8 @@ function attachCommandHandler(client, config, {
     // ── /check — VirusTotal scan ────────────────────────────────────────────────────
     if (cmd === 'check') {
       await interaction.deferReply(); // PUBLIC — survives refresh
-      // channel option accepts: channel name, raw ID, or Discord URL like discord.com/channels/.../channelId
-      const channelRaw = (interaction.options.getString('channel') || '').trim();
+      const channelOpt = interaction.options.get('channel');
+      const channelRaw = (channelOpt ? (channelOpt.value || channelOpt.channel?.id || channelOpt.channel?.name || '') : '').toString().trim();
 
       if (!process.env.VIRUSTOTAL_API_KEY) {
         await interaction.editReply({ content: '❌ `VIRUSTOTAL_API_KEY` is not set. Add it to Railway environment variables.' });
@@ -525,7 +524,7 @@ function attachCommandHandler(client, config, {
 
     // ── /regenerate ───────────────────────────────────────────────────────────
     if (cmd === 'regenerate') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const channelQuery = interaction.options.getString('channel', true);
 
       try {
@@ -569,8 +568,6 @@ function attachCommandHandler(client, config, {
 
         // Re-queue via the pipeline (onIngestLink triggers download → encrypt → upload)
         if (typeof onIngestLink === 'function') {
-          // Don't delete tmpFile here — the async pipeline needs it
-          // Use foundLink (the original MEGA URL) to re-download+re-encrypt+reupload
           onIngestLink(remoteName || ch.name, foundLink, null);
           await interaction.editReply({
             content: `🔄 **Regenerating** link for <#${ch.id}>...\nQueued in pipeline — the channel message will update when done.`,
@@ -596,12 +593,12 @@ function attachCommandHandler(client, config, {
       if (mirrorStatus.running) {
         await interaction.reply({
           content: '⚠️ The mirror engine is currently running. Please stop it or wait for it to finish before fetching.',
-          ephemeral: true
+          flags: MessageFlags.Ephemeral
         });
         return;
       }
 
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       try {
         let startScan;
@@ -648,7 +645,7 @@ function attachCommandHandler(client, config, {
 
     // ── /mg — List MEGA account files, export as .txt ──────────────────────────
     if (cmd === 'mg') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       try {
         await interaction.editReply({ content: '🔐 Connecting to your MEGA account…' });
@@ -706,7 +703,7 @@ function attachCommandHandler(client, config, {
     // ── /shrink — Manually collapse channels south-to-north into batch embeds ──
     if (cmd === 'shrink') {
       const count = interaction.options.getInteger('count') ?? 1;
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       try {
         if (!shrinkControls.shrink) {
           await interaction.editReply({ content: '⚠️ Shrink control not available.' });
@@ -747,7 +744,7 @@ function attachCommandHandler(client, config, {
             '{link} | {key}',
             '```',
           ].join('\n'),
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -783,7 +780,7 @@ function attachCommandHandler(client, config, {
       await interaction.reply({
         content: '✅ **Batch embed template updated!** Preview:',
         embeds: [previewEmbed],
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }

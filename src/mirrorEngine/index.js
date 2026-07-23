@@ -7,32 +7,6 @@
  * Completely isolated from the main watcher pipeline.
  * Has its own state file, its own temp directory, and its own
  * download → encrypt → upload → post flow.
- *
- * Behaviour:
- *  - On start: scans all source guilds/channels for MEGA links
- *  - Resumes from previous state (never re-processes 'done' links)
- *  - Resets 'downloading/encrypting/uploading' to 'pending' on restart
- *    (temp files are cleaned up, no leftover processes)
- *  - Clones exact category name from source to target server
- *  - Non-.zip files are wrapped directly into an AES-256 encrypted zip
- *  - .zip files are decrypted (with sourcePassword) and re-encrypted
- *  - Stops and disconnects selfbot when all work is done — no idle polling
- *
- * State file : mirror-state.json (project root)
- * Temp dir   : mirror-temp/       (cleaned per-link after processing)
- *
- * Config options (config.mirrorEngine):
- *   enabled           {boolean}   Must be true
- *   userToken         {string}    Discord self-bot user token
- *   sourcePassword    {string}    Single password to decrypt ALL source zips
- *   sourceGuildIds    {string[]}  Guilds to scan (empty = all guilds)
- *   excludeGuildIds   {string[]}  Guild IDs to skip
- *   excludeChannelIds {string[]}  Channel IDs to skip
- *   concurrency       {number}    Parallel download+upload workers (default 2)
- *   channelTimeoutMs  {number}    Per-channel scan timeout ms (default 10000)
- *   downloadTimeoutMs {number}    Per-file download timeout ms (default 300000)
- *
- * ⚠  Using a self-bot token violates Discord ToS. Use at your own risk.
  */
 
 const path   = require('path');
@@ -43,23 +17,22 @@ const archiver  = require('archiver');
 const { Client: SelfbotClient } = require('discord.js-selfbot-v13');
 
 const { encryptZip, generatePassword } = require('../zipEncryptor');
-
 const { uploadToMega }   = require('../megaUploader');
 const { createZipChannel, addToBatch } = require('../discordManager');
 const { sendZipMessage } = require('../webhookSender');
 const downloadManager    = require('../downloadEngine/downloadManager');
 const { extractMegaLinks, extractSuggestedName, flattenEmbed } = require('../downloadEngine/linkExtractor');
 const { getClient }      = require('../discordClient');
+const bandwidthManager  = require('../utils/bandwidthManager');
+const { appendSystemLog } = require('../stateStore');
 
 try {
   archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted'));
 } catch (e) {
   if (!e.message.includes('already registered')) throw e;
-  // Format already registered by zipEncryptor.js — skip silently
 }
 
 // ─── Paths ────────────────────────────────────────────────────────────────────
-// Use /tmp for state and temp on read-only hosts (Railway). Fall back to project root locally.
 function resolveWritablePath(preferred) {
   try {
     fs.accessSync(path.dirname(preferred), fs.constants.W_OK);
@@ -89,21 +62,16 @@ function safeDelete(p) {
   try { if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true }); } catch {}
 }
 
-// Normalise a MEGA URL so variant forms of the same link map to one key
 function linkKey(url) {
   return url.replace(/\/$/, '').toLowerCase().trim();
 }
 
 // ─── State ────────────────────────────────────────────────────────────────────
-// Status flow:
-//   pending → downloading → encrypting → uploading → channel_created → done
-//   any step can also transition to: failed
-
 let _state   = {}; // { [linkKey]: LinkEntry }
 let _started = false;
 let _selfbot = null;
 
-// ─── Live engine status (for /mirror status command) ─────────────────────────
+// ─── Live engine status ────────────────────────────────────────────────────────
 const _engineStatus = {
   running:    false,
   phase:      null,
@@ -113,7 +81,12 @@ const _engineStatus = {
 };
 
 function getMirrorEngineStatus() {
-  return { ..._engineStatus };
+  const bw = bandwidthManager.getStatus();
+  return {
+    ..._engineStatus,
+    phase: bw.paused ? `Bandwidth Paused (${bw.remainingSeconds}s remaining)` : _engineStatus.phase,
+    bandwidth: bw,
+  };
 }
 
 function loadState() {
@@ -165,17 +138,20 @@ async function encryptFileAsZip(rawFilePath, outputZipPath, password) {
 
 // ─── Per-link pipeline ────────────────────────────────────────────────────────
 async function processLink(entry, config) {
+  // If bandwidth limit is currently active, wait until it resets
+  if (bandwidthManager.isPaused()) {
+    await bandwidthManager.waitUntilResumed();
+  }
+
   const { link, name, categoryName } = entry;
   const mc = config.mirrorEngine;
   const sourcePassword = mc.sourcePassword || null;
   const outputPassword = generatePassword(12);
 
-  // Per-link temp directory — completely isolated
   const tmpDir = path.join(TEMP_DIR, crypto.randomBytes(8).toString('hex'));
   fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
-
     // ── 1. Download ────────────────────────────────────────────────────────
     setEntry(link, { status: 'downloading', error: null });
 
@@ -191,7 +167,6 @@ async function processLink(entry, config) {
       throw new Error(`Download: ${err.message}`);
     }
 
-    // Determine final display name: remote filename > message-text name > channel name
     const baseName = remoteName
       ? path.basename(remoteName, path.extname(remoteName))
       : safeName(name);
@@ -199,7 +174,6 @@ async function processLink(entry, config) {
     const remoteExt = remoteName ? path.extname(remoteName).toLowerCase() : '';
     const isZip     = remoteExt === '.zip';
 
-    // Rename download.bin to its real extension so 7zip can detect format
     const renamedPath = path.join(tmpDir, remoteName || `${baseName}${remoteExt || '.bin'}`);
     fs.renameSync(dlPath, renamedPath);
 
@@ -209,14 +183,12 @@ async function processLink(entry, config) {
     let encryptedZipPath;
 
     if (isZip) {
-      // Re-encrypt: decrypt with sourcePassword (ignored if zip is not encrypted), pack with new password
       try {
         const result = await encryptZip(renamedPath, outputPassword, sourcePassword);
         encryptedZipPath = result.encryptedPath;
         safeDelete(renamedPath);
       } catch (err) {
         if (sourcePassword && /wrong password/i.test(err.message)) {
-          // Try without password (zip may not actually be encrypted)
           const result = await encryptZip(renamedPath, outputPassword, null);
           encryptedZipPath = result.encryptedPath;
           safeDelete(renamedPath);
@@ -225,7 +197,6 @@ async function processLink(entry, config) {
         }
       }
     } else {
-      // Non-zip: wrap file directly into an AES-256 encrypted zip
       encryptedZipPath = path.join(tmpDir, `${baseName}.zip`);
       try {
         await encryptFileAsZip(renamedPath, encryptedZipPath, outputPassword);
@@ -311,13 +282,24 @@ async function processLink(entry, config) {
         });
       }
       console.log(`[mirrorEngine] ✓ ${baseName}`);
+      appendSystemLog('INFO', `Mirrored "${baseName}" successfully.`, 'mirrorEngine');
     } catch (err) {
       throw new Error(`Post: ${err.message}`);
     }
 
   } catch (err) {
-    console.error(`[mirrorEngine] ✗ ${name}: ${err.message}`);
-    setEntry(link, { status: 'failed', error: err.message });
+    if (downloadManager.isBandwidthError(err)) {
+      const waitSec = downloadManager.extractBandwidthWaitSeconds(err.message);
+      console.warn(`[mirrorEngine] ⏳ Bandwidth limit hit for "${name}". Pausing engine for ${waitSec}s...`);
+      appendSystemLog('WARN', `Bandwidth limit hit processing "${name}". Engine paused for ${waitSec}s (${(waitSec / 3600).toFixed(2)} hrs). Item kept in queue.`, 'mirrorEngine');
+      // Keep entry in pending status so it retries automatically on reset!
+      setEntry(link, { status: 'pending', error: `Bandwidth limit reached — auto-resuming in ${waitSec}s` });
+      bandwidthManager.triggerPause(waitSec, 'mirrorEngine');
+    } else {
+      console.error(`[mirrorEngine] ✗ ${name}: ${err.message}`);
+      appendSystemLog('ERROR', `Mirror failed for "${name}": ${err.message}`, 'mirrorEngine');
+      setEntry(link, { status: 'failed', error: err.message });
+    }
   } finally {
     safeDelete(tmpDir);
   }
@@ -329,14 +311,13 @@ async function scanChannel(channel, timeoutMs) {
   const channelName  = channel.name;
   const results      = [];
   let lastId;
-  const MAX_MESSAGES = 500; // don't dig deeper than 500 msgs per channel
+  const MAX_MESSAGES = 500;
   let fetched = 0;
 
-  // Wrap the ENTIRE channel scan in one deadline
   const deadline = Date.now() + timeoutMs;
 
   while (fetched < MAX_MESSAGES) {
-    if (Date.now() >= deadline) break; // total channel timeout hit
+    if (Date.now() >= deadline) break;
 
     let batch;
     try {
@@ -346,7 +327,7 @@ async function scanChannel(channel, timeoutMs) {
         new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), Math.max(remaining, 1000))),
       ]);
     } catch {
-      break; // permission denied, timeout, or rate limit — move on
+      break;
     }
 
     if (!batch || batch.size === 0) break;
@@ -408,7 +389,6 @@ async function scanAllGuilds(config, selfbot) {
     const total = channels.length;
     console.log(`[mirrorEngine]   ${total} text channel(s) to scan`);
 
-    // Batch concurrent scans with progress
     for (let i = 0; i < channels.length; i += BATCH) {
       const batch     = channels.slice(i, i + BATCH);
       const batchNum  = Math.floor(i / BATCH) + 1;
@@ -433,38 +413,48 @@ async function scanAllGuilds(config, selfbot) {
   return all;
 }
 
-// ─── Concurrency pool ─────────────────────────────────────────────────────────
+// ─── Concurrency pool with bandwidth limit pause support ─────────────────────
 async function runWithConcurrency(items, concurrency, fn) {
   const total = items.length;
   let completed = 0;
   let active = 0;
   let idx = 0;
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     function dispatch() {
+      if (bandwidthManager.isPaused()) {
+        const rem = bandwidthManager.getRemainingSeconds();
+        console.log(`[mirrorEngine] Bandwidth pause active (${rem}s remaining). Concurrency dispatcher waiting...`);
+        bandwidthManager.waitUntilResumed().then(() => dispatch());
+        return;
+      }
+
       while (idx < items.length && active < concurrency) {
+        if (bandwidthManager.isPaused()) break;
+
         const item = items[idx++];
         active++;
         fn(item)
-          .catch(() => {}) // errors already handled inside fn
+          .catch(() => {})
           .finally(() => {
             active--;
             completed++;
+            _engineStatus.done = completed;
+            _engineStatus.total = total;
             console.log(`[mirrorEngine] Progress: ${completed}/${total}`);
             dispatch();
-            if (completed === total) resolve();
+            if (completed === total && active === 0) resolve();
           });
       }
       if (idx === items.length && active === 0 && completed === total) resolve();
     }
+
     if (items.length === 0) { resolve(); return; }
     dispatch();
   });
 }
 
-
 // ─── Main ─────────────────────────────────────────────────────────────────────
-
 function startMirrorEngine(config) {
   const mc = config.mirrorEngine;
 
@@ -481,23 +471,19 @@ function startMirrorEngine(config) {
     return;
   }
 
-  // Prepare directories
   if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
-  // Clean up any leftover temp files from previous runs
   try {
     for (const entry of fs.readdirSync(TEMP_DIR)) {
       safeDelete(path.join(TEMP_DIR, entry));
     }
   } catch {}
 
-  // Support RESET_MIRROR_STATE env var for Railway-based recovery
   if (process.env.RESET_MIRROR_STATE === 'true') {
     console.log('[mirrorEngine] RESET_MIRROR_STATE=true — clearing state for fresh run.');
     _state = {};
     try { if (fs.existsSync(STATE_PATH)) fs.unlinkSync(STATE_PATH); } catch {}
   } else {
-    // Load state and reset stale in-progress entries
     loadState();
   }
 
@@ -511,12 +497,8 @@ function startMirrorEngine(config) {
   }
   if (resetCount) { saveState(); console.log(`[mirrorEngine] Reset ${resetCount} stale entry(ies).`); }
 
-  // State summary
   const counts = Object.values(_state).reduce((a, v) => { a[v.status] = (a[v.status]||0)+1; return a; }, {});
   if (Object.keys(counts).length) console.log('[mirrorEngine] Loaded state:', JSON.stringify(counts));
-
-  // downloadManager.init() is called by index.js before startMirrorEngine.
-  // Do NOT call it again here — it would reset shared download state.
 
   _selfbot = new SelfbotClient({ checkUpdate: false });
   _started = true;
@@ -525,29 +507,35 @@ function startMirrorEngine(config) {
 
   _selfbot.once('ready', async () => {
     console.log(`[mirrorEngine] Selfbot: ${_selfbot.user.tag} (${_selfbot.guilds.cache.size} guild(s))`);
+    appendSystemLog('INFO', `Selfbot logged in as ${_selfbot.user.tag}.`, 'mirrorEngine');
 
     try {
       await runEngine(config);
     } catch (e) {
       console.error('[mirrorEngine] Fatal:', e.message);
+      appendSystemLog('ERROR', `Mirror engine fatal error: ${e.message}`, 'mirrorEngine');
     } finally {
       _started = false;
+      _engineStatus.running = false;
       if (_selfbot) {
         _selfbot.destroy();
         _selfbot = null;
         console.log('[mirrorEngine] Selfbot disconnected. Engine stopped.');
+        appendSystemLog('INFO', 'Mirror engine stopped.', 'mirrorEngine');
       }
     }
   });
 
-  _selfbot.login(mc.userToken).catch(e =>
-    console.error('[mirrorEngine] Login failed:', e.message)
-  );
+  _selfbot.login(mc.userToken).catch(e => {
+    console.error('[mirrorEngine] Login failed:', e.message);
+    appendSystemLog('ERROR', `Selfbot login failed: ${e.message}`, 'mirrorEngine');
+    _started = false;
+  });
 }
 
 async function runEngine(config) {
   const mc          = config.mirrorEngine;
-  const concurrency = Math.max(1, mc.concurrency || 4); // default 4 for speed
+  const concurrency = Math.max(1, mc.concurrency || 4);
 
   _engineStatus.running   = true;
   _engineStatus.lastRunAt = new Date().toISOString();
@@ -555,9 +543,9 @@ async function runEngine(config) {
   // ── Phase 1: Scan ────────────────────────────────────────────────────
   _engineStatus.phase = 'Scanning';
   console.log('[mirrorEngine] ── Phase 1: Scanning for MEGA links...');
+  appendSystemLog('INFO', 'Phase 1: Scanning for MEGA links...', 'mirrorEngine');
   const found = await scanAllGuilds(config, _selfbot);
 
-  // Register new links into state (deduplicated)
   let newCount = 0;
   for (const { link, name, categoryName } of found) {
     if (!getEntry(link)) {
@@ -571,19 +559,22 @@ async function runEngine(config) {
   const failed  = Object.values(_state).filter(e => e.status === 'failed').length;
 
   console.log(`[mirrorEngine] Scan: ${newCount} new, ${pending.length} pending, ${done} done, ${failed} failed.`);
+  appendSystemLog('INFO', `Scan complete: ${newCount} new, ${pending.length} pending, ${done} done, ${failed} failed.`, 'mirrorEngine');
 
   if (pending.length === 0) {
     console.log('[mirrorEngine] Nothing to do — all links processed.');
+    _engineStatus.phase = 'Done';
     return;
   }
 
   // ── Phase 2: Process ──────────────────────────────────────────────────────
+  _engineStatus.phase = 'Processing';
   console.log(`[mirrorEngine] ── Phase 2: Processing ${pending.length} link(s) (concurrency=${concurrency})...`);
   await runWithConcurrency(pending, concurrency, item => processLink(item, config));
 
-  // Final summary
   const fin = Object.values(_state).reduce((a, v) => { a[v.status] = (a[v.status]||0)+1; return a; }, {});
   console.log('[mirrorEngine] ── Done:', JSON.stringify(fin));
+  _engineStatus.phase = 'Done';
 }
 
 function stopMirrorEngine() {
@@ -591,18 +582,15 @@ function stopMirrorEngine() {
   _engineStatus.running = false;
   _engineStatus.phase   = null;
   if (_selfbot) { _selfbot.destroy(); _selfbot = null; }
+  appendSystemLog('INFO', 'Mirror engine manually stopped.', 'mirrorEngine');
 }
 
-/**
- * Clears all mirror state so the engine re-processes every link from scratch.
- * Useful for recovery after accidental channel deletion.
- * @returns {number} Number of entries cleared
- */
 function resetMirrorState() {
   const count = Object.keys(_state).length;
   _state = {};
   try { if (fs.existsSync(STATE_PATH)) fs.unlinkSync(STATE_PATH); } catch {}
   console.log(`[mirrorEngine] State reset — cleared ${count} entries.`);
+  appendSystemLog('WARN', `Mirror state reset (${count} entries cleared).`, 'mirrorEngine');
   return count;
 }
 

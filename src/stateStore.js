@@ -28,12 +28,17 @@ const dbPath  = resolveStatePath();
 const adapter = new FileSync(dbPath);
 const db      = low(adapter);
 
-db.defaults({ files: {}, logs: [], batchState: {
-  dchecksRun: 0,
-  currentBatchChannelId: null,
-  currentLinkCount: 0,
-  batchSeriesNumber: 0,
-} }).write();
+db.defaults({
+  files: {},
+  logs: [],
+  systemLogs: [],
+  batchState: {
+    dchecksRun: 0,
+    currentBatchChannelId: null,
+    currentLinkCount: 0,
+    batchSeriesNumber: 0,
+  },
+}).write();
 
 const emitter = new EventEmitter();
 // Increase max listeners to avoid spurious warnings when many pipeline workers attach
@@ -71,7 +76,7 @@ function updateState(filename, updates) {
 }
 
 function getAllStates() {
-  return db.get('files').value();
+  return db.get('files').value() || {};
 }
 
 function removeState(filename) {
@@ -96,6 +101,34 @@ function clearLogs() {
   emitter.emit('logs-cleared');
 }
 
+// ── System / Control Logs ───────────────────────────────────────────────────
+function appendSystemLog(level, message, source = 'system') {
+  const record = {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    timestamp: new Date().toISOString(),
+    level: level.toUpperCase(),
+    message,
+    source,
+  };
+  const logs = db.get('systemLogs').value() || [];
+  logs.push(record);
+  // Keep last 500 system logs
+  if (logs.length > 500) logs.shift();
+  db.set('systemLogs', logs).write();
+  emitter.emit('system-log', record);
+  return record;
+}
+
+function getSystemLogs(limit = 100) {
+  const logs = db.get('systemLogs').value() || [];
+  return logs.slice(-limit);
+}
+
+function clearSystemLogs() {
+  db.set('systemLogs', []).write();
+  emitter.emit('system-logs-cleared');
+}
+
 // ── Batch State ─────────────────────────────────────────────────────────────
 function getBatchState() {
   return db.get('batchState').value() || {
@@ -108,4 +141,23 @@ function setBatchState(updates) {
   db.set('batchState', { ...current, ...updates }).write();
 }
 
-module.exports = { getState, updateState, getAllStates, removeState, appendLog, getLogs, clearLogs, emitter, getBatchState, setBatchState };
+function getDbPath() {
+  return dbPath;
+}
+
+module.exports = {
+  getState,
+  updateState,
+  getAllStates,
+  removeState,
+  appendLog,
+  getLogs,
+  clearLogs,
+  appendSystemLog,
+  getSystemLogs,
+  clearSystemLogs,
+  emitter,
+  getBatchState,
+  setBatchState,
+  getDbPath,
+};

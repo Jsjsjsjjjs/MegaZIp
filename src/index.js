@@ -560,6 +560,29 @@ async function main() {
     onIngestZip:      ingestUploadedZip,
     onIngestTxt:      handleTxtFile,
     watchFolderPath,
+    mirrorControls: {
+      getStatus: getMirrorEngineStatus,
+      start:  () => startMirrorEngine(config),
+      stop:   stopMirrorEngine,
+      reset:  resetMirrorState,
+    },
+    pipelineControls: {
+      pause:   pauseDownloads,
+      resume:  resumeDownloads,
+      getStatus: () => ({ active: activeCount, queued: queue.length }),
+    },
+    shrinkControls: {
+      shrink: async (n) => {
+        const guild = await client.guilds.fetch(config.guildId);
+        await guild.channels.fetch();
+        return shrinkMinimal(guild, config, n);
+      },
+    },
+    runAutoDedup: async () => {
+      const guild = await client.guilds.fetch(config.guildId);
+      await guild.channels.fetch();
+      return runAutoDedup(guild);
+    },
   });
 
   watchFolder(

@@ -4,6 +4,8 @@ const { File } = require('megajs');
 const yauzl = require('yauzl');
 const { retryWithBackoff } = require('../utils/retry');
 const { markLinkProcessed } = require('./scanState');
+const bandwidthManager = require('../utils/bandwidthManager');
+const { appendSystemLog } = require('../stateStore');
 
 let sharedConfig = null;
 let paused = false;
@@ -20,12 +22,14 @@ function init(config) {
 function pause() {
   paused = true;
   console.log('[downloadEngine] Downloads paused.');
+  appendSystemLog('INFO', 'Download engine paused.', 'downloadEngine');
 }
 
 function resume() {
   if (!paused) return;
   paused = false;
   console.log('[downloadEngine] Downloads resumed.');
+  appendSystemLog('INFO', 'Download engine resumed.', 'downloadEngine');
   drainQueue();
 }
 
@@ -34,6 +38,7 @@ function cancelAll() {
   const dropped = queue.length;
   queue.length = 0;
   console.log(`[downloadEngine] Cancelled — cleared ${dropped} queued job(s). In-flight downloads will still finish.`);
+  appendSystemLog('WARN', `Cancelled download queue (${dropped} items dropped).`, 'downloadEngine');
 }
 
 /**
@@ -49,13 +54,31 @@ async function drainQueue() {
   if (paused || cancelled || !sharedConfig) return;
   const maxConcurrent = sharedConfig.downloadEngine?.concurrentDownloads || 2;
 
+  // Wait if global bandwidth limit is active
+  if (bandwidthManager.isPaused()) {
+    console.log(`[downloadEngine] Waiting for bandwidth limit pause to clear (${bandwidthManager.getRemainingSeconds()}s remaining)...`);
+    await bandwidthManager.waitUntilResumed();
+  }
+
   while (activeCount < maxConcurrent && queue.length > 0 && !paused && !cancelled) {
+    if (bandwidthManager.isPaused()) break;
+
     const item = queue.shift();
     activeCount += 1;
 
     processDownloadJob(item.job)
       .then((result) => item.onComplete(null, result))
-      .catch((err) => item.onComplete(err, null))
+      .catch((err) => {
+        if (isBandwidthError(err)) {
+          const waitSec = extractBandwidthWaitSeconds(err.message);
+          bandwidthManager.triggerPause(waitSec, 'downloadEngine');
+          appendSystemLog('WARN', `MEGA Bandwidth Limit Reached! Pausing download engine for ${waitSec}s. Job for "${item.job.name || item.job.link}" re-queued.`, 'downloadEngine');
+          // Re-queue job so it retries automatically when bandwidth resets
+          queue.unshift(item);
+        } else {
+          item.onComplete(err, null);
+        }
+      })
       .finally(() => {
         activeCount -= 1;
         drainQueue();
@@ -72,11 +95,31 @@ function withTimeout(promise, ms, message) {
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
 }
 
+function isBandwidthError(err) {
+  if (!err || !err.message) return false;
+  return /bandwidth limit|quota exceeded|limit reached|EAGAIN/i.test(err.message);
+}
+
+function extractBandwidthWaitSeconds(errMsg) {
+  if (!errMsg) return 3600;
+  const match = errMsg.match(/Bandwidth limit reached:?\s*(\d+)/i) || errMsg.match(/(\d+)\s*seconds until/i);
+  if (match) {
+    const sec = parseInt(match[1], 10);
+    return isNaN(sec) || sec <= 0 ? 3600 : sec + 30; // 30s safety buffer
+  }
+  return 3600; // 1 hour default
+}
+
 /**
  * Downloads a single MEGA-linked file to `destPath`, logging progress
  * roughly every 10%.
  */
 async function downloadMegaFile(link, destPath, { timeoutMs } = {}) {
+  // If bandwidth limit is active, wait before initiating download
+  if (bandwidthManager.isPaused()) {
+    await bandwidthManager.waitUntilResumed();
+  }
+
   let file;
   try {
     file = File.fromURL(link);
@@ -88,7 +131,11 @@ async function downloadMegaFile(link, destPath, { timeoutMs } = {}) {
     file.loadAttributes(),
     timeoutMs,
     'Timed out loading MEGA file info'
-  );
+  ).catch((err) => {
+    if (isBandwidthError(err)) throw err;
+    throw err;
+  });
+
   const target = loadedFile || file;
 
   if (target.directory || target.children) {
@@ -148,7 +195,6 @@ function validateZip(filePath) {
 
 async function processDownloadJob(job) {
   const dlConfig = sharedConfig.downloadEngine || {};
-  // Use /tmp/downloads as fallback if the configured path is not writable
   let downloadFolder = path.resolve(dlConfig.downloadFolder || './downloads');
   try {
     fs.mkdirSync(downloadFolder, { recursive: true });
@@ -172,12 +218,16 @@ async function processDownloadJob(job) {
         retries: dlConfig.retryCount ?? 3,
         delaysMs: [3000, 8000, 15000],
         onAttemptFail: (attempt, err) => {
+          if (isBandwidthError(err)) throw err; // Don't burn retries on bandwidth errors
           console.warn(`[downloadEngine] Attempt ${attempt} failed for ${job.link}: ${err.message}`);
           if (fs.existsSync(tempPath)) fs.rmSync(tempPath, { force: true });
         },
       }
     );
   } catch (err) {
+    if (isBandwidthError(err)) {
+      throw err; // Passed up to drainQueue for bandwidth pause handling
+    }
     console.error(`[downloadEngine] Giving up on ${job.link} after retries: ${err.message}`);
     markLinkProcessed(job.link, { status: 'failed', error: err.message });
     throw err;
@@ -188,4 +238,4 @@ async function processDownloadJob(job) {
   return tempPath;
 }
 
-module.exports = { init, enqueueDownload, pause, resume, cancelAll, downloadMegaFile };
+module.exports = { init, enqueueDownload, pause, resume, cancelAll, downloadMegaFile, isBandwidthError, extractBandwidthWaitSeconds };
