@@ -518,39 +518,9 @@ async function main() {
   console.log(`[index] Pipeline concurrency: ${MAX_CONCURRENT}`);
   console.log(`[index] Node.js: ${process.version}`);
 
-  const client = await getClient(config);
-  console.log(`[index] Discord bot logged in as ${client.user.tag}`);
+  let discordClient = null;
 
-  if (config.discordClientId) {
-    try {
-      await registerCommands(config);
-      attachCommandHandler(client, config, {
-        mirrorControls: {
-          getStatus: getMirrorEngineStatus,
-          start:  () => startMirrorEngine(config),
-          stop:   stopMirrorEngine,
-          reset:  resetMirrorState,
-        },
-        pipelineControls: {
-          pause:   pauseDownloads,
-          resume:  resumeDownloads,
-          getStatus: () => ({ active: activeCount, queued: queue.length }),
-        },
-        onIngestLink: downloadAndIngest,
-        shrinkControls: {
-          shrink: async (n) => {
-            const guild = await client.guilds.fetch(config.guildId);
-            await guild.channels.fetch();
-            return shrinkMinimal(guild, config, n);
-          },
-        },
-      });
-      console.log('[index] Slash commands registered.');
-    } catch (err) {
-      console.warn(`[index] Slash commands unavailable: ${err.message}`);
-    }
-  }
-
+  // 1. ALWAYS start Web GUI server FIRST so Railway health check passes immediately
   startGuiServer(config, {
     onRetry:          retryFile,
     onDownloadPause:  pauseDownloads,
@@ -573,18 +543,21 @@ async function main() {
     },
     shrinkControls: {
       shrink: async (n) => {
-        const guild = await client.guilds.fetch(config.guildId);
+        if (!discordClient) throw new Error('Discord bot not connected yet.');
+        const guild = await discordClient.guilds.fetch(config.guildId);
         await guild.channels.fetch();
         return shrinkMinimal(guild, config, n);
       },
     },
     runAutoDedup: async () => {
-      const guild = await client.guilds.fetch(config.guildId);
+      if (!discordClient) throw new Error('Discord bot not connected yet.');
+      const guild = await discordClient.guilds.fetch(config.guildId);
       await guild.channels.fetch();
       return runAutoDedup(guild);
     },
   });
 
+  // 2. Initialize folder watcher and download engine
   watchFolder(
     watchFolderPath,
     (zipPath) => {
@@ -602,15 +575,51 @@ async function main() {
     (txtPath) => handleTxtFile(txtPath)
   );
 
-  // Init download manager once — shared by download engine, TXT ingester, and mirror engine
   downloadManager.init(config);
-
   startDownloadEngine(config, ingestDownloadedFile);
-
-  // ── Resume incomplete pipeline items from last run ────────────────────────
   resumeIncompleteItems();
 
-  // Mirror engine is fully standalone — only start if enabled
+  // 3. Log into Discord in background (wrapped in try/catch so bot errors don't crash web server)
+  try {
+    discordClient = await getClient(config);
+    console.log(`[index] Discord bot logged in as ${discordClient.user.tag}`);
+
+    if (config.discordClientId) {
+      try {
+        await registerCommands(config);
+        attachCommandHandler(discordClient, config, {
+          mirrorControls: {
+            getStatus: getMirrorEngineStatus,
+            start:  () => startMirrorEngine(config),
+            stop:   stopMirrorEngine,
+            reset:  resetMirrorState,
+          },
+          pipelineControls: {
+            pause:   pauseDownloads,
+            resume:  resumeDownloads,
+            getStatus: () => ({ active: activeCount, queued: queue.length }),
+          },
+          onIngestLink: downloadAndIngest,
+          shrinkControls: {
+            shrink: async (n) => {
+              const guild = await discordClient.guilds.fetch(config.guildId);
+              await guild.channels.fetch();
+              return shrinkMinimal(guild, config, n);
+            },
+          },
+        });
+        console.log('[index] Slash commands registered.');
+      } catch (err) {
+        console.warn(`[index] Slash commands unavailable: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    console.error(`[index] Discord bot login failed: ${err.message}. Web dashboard remains online.`);
+    const { appendSystemLog } = require('./stateStore');
+    appendSystemLog('ERROR', `Discord bot login failed: ${err.message}. Web dashboard remains online.`, 'index');
+  }
+
+  // 4. Start standalone mirror engine if enabled
   startMirrorEngine(config);
 }
 
