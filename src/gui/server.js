@@ -331,11 +331,11 @@ function startGuiServer(config, handlers = {}) {
   const basePort = parseInt(process.env.PORT, 10) || config.guiPort || 3737;
 
   function tryListen(port) {
-    server.listen(port, () => {
+    server.listen(port, '0.0.0.0', () => {
       if (port !== basePort) {
-        console.warn(`[gui] Port ${basePort} in use — dashboard running at http://localhost:${port}`);
+        console.warn(`[gui] Port ${basePort} in use — dashboard running at http://0.0.0.0:${port}`);
       } else {
-        console.log(`[gui] Dashboard running at http://localhost:${port}`);
+        console.log(`[gui] Dashboard running at http://0.0.0.0:${port}`);
       }
     });
 
