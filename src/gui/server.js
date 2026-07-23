@@ -71,6 +71,10 @@ function startGuiServer(config, handlers = {}) {
     limits: { fileSize: 500 * 1024 * 1024 }, // 500 MB max
   });
 
+  // ── Health Check Endpoints (for Railway / Cloud Hosting) ───────────────────
+  app.get('/health', (req, res) => res.status(200).send('OK'));
+  app.get('/healthz', (req, res) => res.status(200).send('OK'));
+
   // ── REST API ─────────────────────────────────────────────────────────────────
 
   app.get('/api/status', (req, res) => res.json(getAllStates() || {}));
