@@ -334,27 +334,27 @@ function startGuiServer(config, handlers = {}) {
 
   const basePort = parseInt(process.env.PORT, 10) || config.guiPort || 3737;
 
-  function tryListen(port) {
+  function listenOnPort(port) {
     server.listen(port, '0.0.0.0', () => {
-      if (port !== basePort) {
-        console.warn(`[gui] Port ${basePort} in use — dashboard running at http://0.0.0.0:${port}`);
-      } else {
-        console.log(`[gui] Dashboard running at http://0.0.0.0:${port}`);
-      }
+      console.log(`[gui] Web Dashboard running on 0.0.0.0:${port} (PORT env: ${process.env.PORT || 'not set, default 3737'})`);
     });
 
     server.once('error', (err) => {
       if (err.code === 'EADDRINUSE') {
-        console.warn(`[gui] Port ${port} already in use, trying ${port + 1}...`);
-        server.close();
-        tryListen(port + 1);
+        if (process.env.PORT) {
+          console.error(`[gui] Fatal: PORT ${port} is in use. On Railway/cloud hosting, port must match process.env.PORT.`);
+        } else {
+          console.warn(`[gui] Port ${port} in use, trying ${port + 1}...`);
+          server.close();
+          listenOnPort(port + 1);
+        }
       } else {
         console.error(`[gui] Server error: ${err.message}`);
       }
     });
   }
 
-  tryListen(basePort);
+  listenOnPort(basePort);
   return server;
 }
 
