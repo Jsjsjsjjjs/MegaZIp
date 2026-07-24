@@ -207,10 +207,10 @@ async function registerCommands(config) {
     // ── /recover — Auto-recover state from target server ───────────────────────
     new SlashCommandBuilder()
       .setName('recover')
-      .setDescription('Auto-recover state by inspecting existing channels in target server (owner only)')
+      .setDescription('Auto-recover state from target server channel ID, URL, or Name (owner only)')
       .addStringOption(o =>
-        o.setName('lastchannel')
-          .setDescription('Optional name of last channel created in target server (e.g. Spear Cloud P4ss Ch4ng3r)')
+        o.setName('channel')
+          .setDescription('Discord Channel ID, URL, or Name (e.g. 123456789... or spear-cloud-pass-changer)')
           .setRequired(false)
       )
       .toJSON(),
@@ -872,7 +872,7 @@ function attachCommandHandler(client, config, {
 
     // ── /recover handler ──────────────────────────────────────────────────────
     if (cmd === 'recover') {
-      const lastchannel = interaction.options.getString('lastchannel');
+      const channelOpt = interaction.options.getString('channel') || interaction.options.getString('lastchannel');
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       try {
@@ -881,9 +881,11 @@ function attachCommandHandler(client, config, {
           throw new Error('Recovery function not available.');
         }
 
-        const result = await mirrorControls.recoverStateFromTargetGuild(guild, config, lastchannel);
+        const result = await mirrorControls.recoverStateFromTargetGuild(guild, config, channelOpt);
+        const resolvedText = result.targetChannelName ? `Resolved Channel Checkpoint: \`#${result.targetChannelName}\`` : 'Auto-scanned target channels';
+
         await interaction.editReply({
-          content: `✅ **State Recovery Completed!**\n- Target Channels Scanned: **${result.totalTargetChannels}**\n- Items Recovered & Marked Done: **${result.recoveredCount}**\n${lastchannel ? `- Checkpoint Channel Filter: \`${lastchannel}\`\n` : ''}\n🔄 Engine ready to resume processing remaining links!`,
+          content: `✅ **State Recovery Completed!**\n- ${resolvedText}\n- Target Channels Scanned: **${result.totalTargetChannels}**\n- Items Recovered & Marked Done: **${result.recoveredCount}**\n\n🚀 Resuming mirror pipeline from the next unprocessed link!`,
         });
 
         if (mirrorControls.start) mirrorControls.start();

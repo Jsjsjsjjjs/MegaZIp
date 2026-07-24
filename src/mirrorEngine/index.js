@@ -645,15 +645,36 @@ function resetMirrorState() {
 }
 
 // ─── Target Guild State Recovery ─────────────────────────────────────────────
-async function recoverStateFromTargetGuild(guild, config, lastChannelNameFilter = null) {
+async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
   await guild.channels.fetch();
 
   loadState();
 
+  let targetChannelName = null;
+  let targetChannelId = null;
+
+  if (channelInput && typeof channelInput === 'string') {
+    const rawInput = channelInput.trim();
+    // Extract channel ID if URL or ID string provided
+    const idMatch = rawInput.match(/\d{17,20}/);
+    if (idMatch) {
+      targetChannelId = idMatch[0];
+      try {
+        const ch = await guild.channels.fetch(targetChannelId);
+        if (ch) targetChannelName = ch.name;
+      } catch (err) {
+        console.warn(`[mirrorEngine] Target channel ID ${targetChannelId} not found in guild: ${err.message}`);
+      }
+    }
+    if (!targetChannelName) {
+      targetChannelName = rawInput.replace(/^#/, '').trim();
+    }
+  }
+
+  console.log(`[mirrorEngine] Starting target state recovery... (Channel input: "${channelInput || 'auto-scan'}", Resolved name: "${targetChannelName || 'all'}")`);
+
   let recoveredCount = 0;
   const textChannels = guild.channels.cache.filter(c => c.type === 0 || c.type === 'GUILD_TEXT');
-
-  console.log(`[mirrorEngine] Target recovery scanning ${textChannels.size} channel(s) in "${guild.name}"...`);
 
   // 1. Scan target channels to match posted links directly
   for (const channel of textChannels.values()) {
@@ -682,21 +703,27 @@ async function recoverStateFromTargetGuild(guild, config, lastChannelNameFilter 
     } catch {}
   }
 
-  // 2. If lastChannelNameFilter is provided (e.g. "Spear Cloud P4ss Ch4ng3r"), mark all entries up to that name as done
-  if (lastChannelNameFilter && typeof lastChannelNameFilter === 'string') {
-    const filterNorm = lastChannelNameFilter.normalize('NFKD').toLowerCase().trim();
+  // 2. If targetChannelName is resolved, find matching channel/entry in source state and mark all items up to it as done
+  if (targetChannelName) {
+    const filterNorm = targetChannelName.normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
     let hitMatch = false;
 
     for (const [k, entry] of Object.entries(_state)) {
-      const entryNameNorm = (entry.name || '').normalize('NFKD').toLowerCase().trim();
-      if (entryNameNorm === filterNorm || entryNameNorm.includes(filterNorm)) {
+      const entryNameNorm = (entry.name || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const entryChanId = entry.sourceChannelId || entry.channelId || '';
+
+      const isNameMatch = entryNameNorm && (entryNameNorm === filterNorm || entryNameNorm.includes(filterNorm) || filterNorm.includes(entryNameNorm));
+      const isIdMatch = targetChannelId && entryChanId === targetChannelId;
+
+      if (isNameMatch || isIdMatch) {
         hitMatch = true;
         if (entry.status !== 'done') {
           _state[k] = { ...entry, status: 'done', lastUpdated: new Date().toISOString() };
           recoveredCount++;
         }
-        break; // Stop marking once we reach the checkpoint channel!
+        break; // Stop marking once we reach the target channel checkpoint!
       }
+
       if (!hitMatch && entry.status === 'pending') {
         _state[k] = { ...entry, status: 'done', lastUpdated: new Date().toISOString() };
         recoveredCount++;
@@ -705,9 +732,13 @@ async function recoverStateFromTargetGuild(guild, config, lastChannelNameFilter 
   }
 
   saveState();
-  appendSystemLog('WARN', `Target server state recovery: ${recoveredCount} channel(s) recovered and marked as done.`, 'mirrorEngine');
+  appendSystemLog('WARN', `Target server state recovery complete: ${recoveredCount} item(s) marked done up to "${targetChannelName || 'auto'}".`, 'mirrorEngine');
 
-  return { recoveredCount, totalTargetChannels: textChannels.size };
+  return {
+    recoveredCount,
+    totalTargetChannels: textChannels.size,
+    targetChannelName: targetChannelName || null,
+  };
 }
 
 module.exports = {

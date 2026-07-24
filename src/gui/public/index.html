@@ -888,17 +888,19 @@ async function importStateArchiveGui() {
 }
 
 async function triggerGuildRecovery() {
-  const lastchannel = prompt('Optional: Enter the name of the LAST channel created in your target server (e.g. "Spear Cloud P4ss Ch4ng3r"):');
-  toast('Syncing & recovering state from target server...', 'info');
+  const input = prompt('Enter the Target Discord Channel ID, URL, or Channel Name (e.g. 1234567890... or spear-cloud-pass-changer):');
+  if (input === null) return;
+  toast('Syncing & recovering state from target channel...', 'info');
   try {
     const res = await fetch('/api/control/recover', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lastchannel: lastchannel ? lastchannel.trim() : null }),
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ lastchannel: input.trim() || null }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Recovery failed');
-    toast(`Target state recovered! Marked ${data.result.recoveredCount} item(s) as done from ${data.result.totalTargetChannels} target channels.`, 'success');
+    const chInfo = data.result.targetChannelName ? ` (#${data.result.targetChannelName})` : '';
+    toast(`Target state recovered${chInfo}! Marked ${data.result.recoveredCount} item(s) as done. Resuming pipeline...`, 'success');
     fetchTelemetry();
   } catch (err) {
     toast(err.message, 'error');
