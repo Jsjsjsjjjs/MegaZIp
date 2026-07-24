@@ -644,8 +644,9 @@ function resetMirrorState() {
   return count;
 }
 
-// ─── Target Guild State Recovery (Blazing Fast Checkpoint Matching) ───────────
+// ─── Target Guild State Recovery (100% Exact Target Channel Matching) ────────
 async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
+  await guild.channels.fetch();
   loadState();
 
   let targetChannelName = null;
@@ -653,7 +654,6 @@ async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
 
   if (channelInput && typeof channelInput === 'string') {
     const rawInput = channelInput.trim();
-    // Extract channel ID if URL or ID string provided
     const idMatch = rawInput.match(/\d{17,20}/);
     if (idMatch) {
       targetChannelId = idMatch[0];
@@ -669,79 +669,68 @@ async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
     }
   }
 
-  console.log(`[mirrorEngine] Fast target state recovery starting... (Channel input: "${channelInput || 'auto-scan'}", Resolved name: "${targetChannelName || 'all'}")`);
-
-  let recoveredCount = 0;
-
-  // 1. If a channel checkpoint was provided, run INSTANT in-memory state checkpoint matching (< 100ms)
-  if (targetChannelName || targetChannelId) {
-    const filterNorm = (targetChannelName || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
-    let hitMatch = false;
-
-    for (const [k, entry] of Object.entries(_state)) {
-      const entryNameNorm = (entry.name || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
-      const entryChanId = entry.sourceChannelId || entry.channelId || '';
-
-      const isNameMatch = filterNorm && entryNameNorm && (entryNameNorm === filterNorm || entryNameNorm.includes(filterNorm) || filterNorm.includes(entryNameNorm));
-      const isIdMatch = targetChannelId && entryChanId === targetChannelId;
-
-      if (isNameMatch || isIdMatch) {
-        hitMatch = true;
-        if (entry.status !== 'done') {
-          _state[k] = { ...entry, status: 'done', lastUpdated: new Date().toISOString() };
-          recoveredCount++;
-        }
-        break; // Stop marking once we reach the checkpoint channel!
-      }
-
-      if (!hitMatch && entry.status === 'pending') {
-        _state[k] = { ...entry, status: 'done', lastUpdated: new Date().toISOString() };
-        recoveredCount++;
-      }
-    }
-  } else {
-    // 2. If no channel input was provided, scan target channels in parallel batches (fast scan)
-    await guild.channels.fetch();
-    const textChannels = [...guild.channels.cache.filter(c => c.type === 0 || c.type === 'GUILD_TEXT').values()];
-    const BATCH_SIZE = 15;
-
-    for (let i = 0; i < textChannels.length; i += BATCH_SIZE) {
-      const batch = textChannels.slice(i, i + BATCH_SIZE);
-      await Promise.allSettled(batch.map(async (channel) => {
-        try {
-          const msgs = await channel.messages.fetch({ limit: 5 });
-          for (const msg of msgs.values()) {
-            const text = (msg.content || '') + ' ' + (msg.embeds ? msg.embeds.map(flattenEmbed).join(' ') : '');
-            const links = extractMegaLinks(text);
-
-            for (const megaLink of links) {
-              const k = linkKey(megaLink);
-              if (_state[k] && _state[k].status !== 'done') {
-                _state[k] = {
-                  ..._state[k],
-                  status: 'done',
-                  channelId: channel.id,
-                  messageId: msg.id,
-                  megaLink,
-                  error: null,
-                  lastUpdated: new Date().toISOString(),
-                };
-                recoveredCount++;
-              }
-            }
-          }
-        } catch {}
-      }));
+  // 1. Build a lookup set of all normalized text channel names existing in the target server
+  const existingTargetChannelNames = new Set();
+  for (const ch of guild.channels.cache.values()) {
+    if (ch.type === 0 || ch.type === 'GUILD_TEXT') {
+      const norm = ch.name.normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (norm) existingTargetChannelNames.add(norm);
     }
   }
 
+  console.log(`[mirrorEngine] Target state recovery: Found ${existingTargetChannelNames.size} existing text channel(s) in target guild "${guild.name}".`);
+
+  let recoveredCount = 0;
+
+  // 2. If a specific checkpoint target channel was provided, find its index in _state
+  const entriesArray = Object.entries(_state);
+  let checkpointIndex = -1;
+
+  if (targetChannelName) {
+    const filterNorm = targetChannelName.normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
+    checkpointIndex = entriesArray.findIndex(([k, entry]) => {
+      const entryNorm = (entry.name || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const entryChanId = entry.sourceChannelId || entry.channelId || '';
+      return (filterNorm && entryNorm && (entryNorm === filterNorm || entryNorm.includes(filterNorm) || filterNorm.includes(entryNorm))) ||
+             (targetChannelId && entryChanId === targetChannelId);
+    });
+  }
+
+  // 3. Process _state entries:
+  // If checkpointIndex is found, mark items 0..checkpointIndex as done.
+  // Otherwise, mark an item as done ONLY IF its name matches an existing target channel in guild!
+  entriesArray.forEach(([k, entry], idx) => {
+    const entryNorm = (entry.name || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const existsInTargetGuild = existingTargetChannelNames.has(entryNorm);
+
+    const shouldMarkDone = (checkpointIndex !== -1 && idx <= checkpointIndex) || existsInTargetGuild;
+
+    if (shouldMarkDone) {
+      if (entry.status !== 'done') {
+        _state[k] = { ...entry, status: 'done', lastUpdated: new Date().toISOString() };
+        recoveredCount++;
+      }
+    } else {
+      // If channel does not exist in target server and is after checkpoint, keep as pending!
+      if (entry.status === 'done' && !existsInTargetGuild && checkpointIndex !== -1 && idx > checkpointIndex) {
+        _state[k] = { ...entry, status: 'pending', lastUpdated: new Date().toISOString() };
+      }
+    }
+  });
+
   saveState();
-  appendSystemLog('WARN', `Fast state recovery complete: ${recoveredCount} item(s) marked done up to "${targetChannelName || 'auto'}".`, 'mirrorEngine');
+
+  const finalPending = Object.values(_state).filter(e => e.status === 'pending').length;
+  const finalDone    = Object.values(_state).filter(e => e.status === 'done').length;
+
+  appendSystemLog('WARN', `State recovery complete: ${recoveredCount} marked done. Total done: ${finalDone}, pending remaining: ${finalPending}.`, 'mirrorEngine');
 
   return {
     recoveredCount,
     totalTargetChannels: guild.channels.cache.size || 0,
     targetChannelName: targetChannelName || null,
+    finalDone,
+    finalPending,
   };
 }
 
