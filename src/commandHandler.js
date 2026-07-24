@@ -882,10 +882,10 @@ function attachCommandHandler(client, config, {
         }
 
         const result = await mirrorControls.recoverStateFromTargetGuild(guild, config, channelOpt);
-        const resolvedText = result.targetChannelName ? `Resolved Channel Checkpoint: \`#${result.targetChannelName}\`` : 'Auto-scanned target channels';
+        const resolvedText = result.targetChannelName ? `Resolved Checkpoint: \`#${result.targetChannelName}\`` : 'Auto-scanned target channels';
 
         await interaction.editReply({
-          content: `✅ **State Recovery Completed!**\n- ${resolvedText}\n- Target Channels Scanned: **${result.totalTargetChannels}**\n- Items Recovered & Marked Done: **${result.recoveredCount}**\n\n🚀 Resuming mirror pipeline from the next unprocessed link!`,
+          content: `✅ **State Recovery Completed!**\n- ${resolvedText}\n- Existing Target Channels: **${result.totalTargetChannels}**\n- Confirmed Done: **${result.finalDone}**\n- Reset Back to Pending: **${result.resetToPendingCount}**\n- Remaining Pending Items: **${result.finalPending}**\n\n🚀 Resuming mirror pipeline from item #${(result.finalDone || 0) + 1}!`,
         });
 
         if (mirrorControls.start) mirrorControls.start();

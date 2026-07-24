@@ -680,8 +680,6 @@ async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
 
   console.log(`[mirrorEngine] Target state recovery: Found ${existingTargetChannelNames.size} existing text channel(s) in target guild "${guild.name}".`);
 
-  let recoveredCount = 0;
-
   // 2. If a specific checkpoint target channel was provided, find its index in _state
   const entriesArray = Object.entries(_state);
   let checkpointIndex = -1;
@@ -696,8 +694,10 @@ async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
     });
   }
 
+  let recoveredCount = 0;
+  let resetToPendingCount = 0;
+
   // 3. Process _state entries:
-  // If checkpointIndex is found, mark items 0..checkpointIndex as done.
   // Otherwise, mark an item as done ONLY IF its name matches an existing target channel in guild!
   entriesArray.forEach(([k, entry], idx) => {
     const entryNorm = (entry.name || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
