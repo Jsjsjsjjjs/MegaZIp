@@ -288,6 +288,27 @@ function startGuiServer(config, handlers = {}) {
     }
   });
 
+  // Target Guild Recovery (/recover)
+  app.post('/api/control/recover', async (req, res) => {
+    const { lastchannel } = req.body || {};
+    if (typeof mirrorControls.recoverStateFromTargetGuild !== 'function') {
+      return res.status(500).json({ error: 'Recovery function not available.' });
+    }
+    try {
+      const { getClient } = require('../discordClient');
+      const botClient = await getClient(config);
+      const guild = await botClient.guilds.fetch(config.guildId);
+
+      appendSystemLog('INFO', 'Triggering target guild state recovery...', 'gui');
+      const result = await mirrorControls.recoverStateFromTargetGuild(guild, config, lastchannel);
+      if (mirrorControls.start) mirrorControls.start();
+      res.json({ ok: true, result });
+    } catch (err) {
+      appendSystemLog('ERROR', `Recovery failed: ${err.message}`, 'gui');
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Ingest a raw MEGA link directly from the GUI
   app.post('/api/ingest-link', (req, res) => {
     const { name, link, password } = req.body || {};

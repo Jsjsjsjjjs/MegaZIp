@@ -467,16 +467,17 @@
           </div>
         </div>
 
-        <!-- State Archive Backup & Restore (/sa) -->
+        <!-- State Archive & Recovery (/sa & /recover) -->
         <div class="card">
           <div class="card-title">
-            <span>📦 State Archive (`/sa`)</span>
-            <span style="font-size:12px;color:var(--text3)">Checkpoint Backup</span>
+            <span>📦 State Archive & Recovery</span>
+            <span style="font-size:12px;color:var(--text3)">`/sa` & `/recover`</span>
           </div>
-          <p style="font-size:12.5px;color:var(--text2);margin-bottom:14px;">Export or import complete bot state as Base64 code to preserve scanning and queue progress.</p>
+          <p style="font-size:12.5px;color:var(--text2);margin-bottom:14px;">Backup state code or auto-sync state directly from target Discord server channels.</p>
           <div class="btn-group">
-            <button class="btn btn-primary" onclick="exportStateArchiveGui()">📥 Export Base64 Code</button>
-            <button class="btn btn-warning" onclick="importStateArchiveGui()">📤 Import Base64 Code</button>
+            <button class="btn btn-primary" onclick="exportStateArchiveGui()">📥 Export Code</button>
+            <button class="btn btn-warning" onclick="importStateArchiveGui()">📤 Import Code</button>
+            <button class="btn btn-ghost" onclick="triggerGuildRecovery()">🔄 Sync Target Server (`/recover`)</button>
           </div>
         </div>
 
@@ -880,6 +881,24 @@ async function importStateArchiveGui() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Import failed');
     toast(`State restored! Restored ${data.result.filesCount} pipeline files and ${data.result.mirrorCount} mirror links.`, 'success');
+    fetchTelemetry();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function triggerGuildRecovery() {
+  const lastchannel = prompt('Optional: Enter the name of the LAST channel created in your target server (e.g. "Spear Cloud P4ss Ch4ng3r"):');
+  toast('Syncing & recovering state from target server...', 'info');
+  try {
+    const res = await fetch('/api/control/recover', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lastchannel: lastchannel ? lastchannel.trim() : null }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Recovery failed');
+    toast(`Target state recovered! Marked ${data.result.recoveredCount} item(s) as done from ${data.result.totalTargetChannels} target channels.`, 'success');
     fetchTelemetry();
   } catch (err) {
     toast(err.message, 'error');

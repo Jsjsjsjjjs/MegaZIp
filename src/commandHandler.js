@@ -203,6 +203,17 @@ async function registerCommands(config) {
           .setRequired(false)
       )
       .toJSON(),
+
+    // ── /recover — Auto-recover state from target server ───────────────────────
+    new SlashCommandBuilder()
+      .setName('recover')
+      .setDescription('Auto-recover state by inspecting existing channels in target server (owner only)')
+      .addStringOption(o =>
+        o.setName('lastchannel')
+          .setDescription('Optional name of last channel created in target server (e.g. Spear Cloud P4ss Ch4ng3r)')
+          .setRequired(false)
+      )
+      .toJSON(),
   ];
 
   const rest = new REST({ version: '10' }).setToken(config.discordToken);
@@ -857,6 +868,29 @@ function attachCommandHandler(client, config, {
         }
         return;
       }
+    }
+
+    // ── /recover handler ──────────────────────────────────────────────────────
+    if (cmd === 'recover') {
+      const lastchannel = interaction.options.getString('lastchannel');
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      try {
+        const guild = await client.guilds.fetch(config.guildId);
+        if (!mirrorControls.recoverStateFromTargetGuild) {
+          throw new Error('Recovery function not available.');
+        }
+
+        const result = await mirrorControls.recoverStateFromTargetGuild(guild, config, lastchannel);
+        await interaction.editReply({
+          content: `✅ **State Recovery Completed!**\n- Target Channels Scanned: **${result.totalTargetChannels}**\n- Items Recovered & Marked Done: **${result.recoveredCount}**\n${lastchannel ? `- Checkpoint Channel Filter: \`${lastchannel}\`\n` : ''}\n🔄 Engine ready to resume processing remaining links!`,
+        });
+
+        if (mirrorControls.start) mirrorControls.start();
+      } catch (err) {
+        await interaction.editReply({ content: `❌ Recovery failed: ${err.message}` });
+      }
+      return;
     }
   });
 

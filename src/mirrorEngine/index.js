@@ -644,6 +644,72 @@ function resetMirrorState() {
   return count;
 }
 
+// ─── Target Guild State Recovery ─────────────────────────────────────────────
+async function recoverStateFromTargetGuild(guild, config, lastChannelNameFilter = null) {
+  await guild.channels.fetch();
+
+  loadState();
+
+  let recoveredCount = 0;
+  const textChannels = guild.channels.cache.filter(c => c.type === 0 || c.type === 'GUILD_TEXT');
+
+  console.log(`[mirrorEngine] Target recovery scanning ${textChannels.size} channel(s) in "${guild.name}"...`);
+
+  // 1. Scan target channels to match posted links directly
+  for (const channel of textChannels.values()) {
+    try {
+      const msgs = await channel.messages.fetch({ limit: 10 });
+      for (const msg of msgs.values()) {
+        const text = (msg.content || '') + ' ' + (msg.embeds ? msg.embeds.map(flattenEmbed).join(' ') : '');
+        const links = extractMegaLinks(text);
+
+        for (const megaLink of links) {
+          const k = linkKey(megaLink);
+          if (_state[k] && _state[k].status !== 'done') {
+            _state[k] = {
+              ..._state[k],
+              status: 'done',
+              channelId: channel.id,
+              messageId: msg.id,
+              megaLink,
+              error: null,
+              lastUpdated: new Date().toISOString(),
+            };
+            recoveredCount++;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 2. If lastChannelNameFilter is provided (e.g. "Spear Cloud P4ss Ch4ng3r"), mark all entries up to that name as done
+  if (lastChannelNameFilter && typeof lastChannelNameFilter === 'string') {
+    const filterNorm = lastChannelNameFilter.normalize('NFKD').toLowerCase().trim();
+    let hitMatch = false;
+
+    for (const [k, entry] of Object.entries(_state)) {
+      const entryNameNorm = (entry.name || '').normalize('NFKD').toLowerCase().trim();
+      if (entryNameNorm === filterNorm || entryNameNorm.includes(filterNorm)) {
+        hitMatch = true;
+        if (entry.status !== 'done') {
+          _state[k] = { ...entry, status: 'done', lastUpdated: new Date().toISOString() };
+          recoveredCount++;
+        }
+        break; // Stop marking once we reach the checkpoint channel!
+      }
+      if (!hitMatch && entry.status === 'pending') {
+        _state[k] = { ...entry, status: 'done', lastUpdated: new Date().toISOString() };
+        recoveredCount++;
+      }
+    }
+  }
+
+  saveState();
+  appendSystemLog('WARN', `Target server state recovery: ${recoveredCount} channel(s) recovered and marked as done.`, 'mirrorEngine');
+
+  return { recoveredCount, totalTargetChannels: textChannels.size };
+}
+
 module.exports = {
   startMirrorEngine,
   stopMirrorEngine,
@@ -651,4 +717,5 @@ module.exports = {
   resetMirrorState,
   getMirrorState,
   setMirrorState,
+  recoverStateFromTargetGuild,
 };
