@@ -24,7 +24,7 @@ const downloadManager    = require('../downloadEngine/downloadManager');
 const { extractMegaLinks, extractSuggestedName, flattenEmbed } = require('../downloadEngine/linkExtractor');
 const { getClient }      = require('../discordClient');
 const bandwidthManager  = require('../utils/bandwidthManager');
-const { appendSystemLog } = require('../stateStore');
+const { appendSystemLog, getMirrorStateDb, setMirrorStateDb } = require('../stateStore');
 
 try {
   archiver.registerFormat('zip-encrypted', require('archiver-zip-encrypted'));
@@ -98,6 +98,9 @@ function loadState() {
   } catch {
     _state = {};
   }
+  // Fallback and merge with lowdb mirrorState to guarantee zero state loss across container restarts
+  const dbMirrorState = getMirrorStateDb();
+  _state = { ...dbMirrorState, ..._state };
 }
 
 function saveState() {
@@ -109,6 +112,9 @@ function saveState() {
   } catch (e) {
     console.error('[mirrorEngine] Could not save state:', e.message);
   }
+  try {
+    setMirrorStateDb(_state);
+  } catch {}
 }
 
 function getEntry(url)         { return _state[linkKey(url)] || null; }
@@ -568,10 +574,19 @@ async function runEngine(config) {
   _engineStatus.running   = true;
   _engineStatus.lastRunAt = new Date().toISOString();
 
-  // ── Phase 1: Scan ────────────────────────────────────────────────────
+  // ── Step 1: Process existing pending links from state FIRST ─────────────────
+  let pending = Object.values(_state).filter(e => e.status === 'pending');
+  if (pending.length > 0) {
+    console.log(`[mirrorEngine] Found ${pending.length} existing pending link(s) in state — processing directly without re-scanning.`);
+    appendSystemLog('INFO', `Resuming ${pending.length} pending link(s) directly from state.`, 'mirrorEngine');
+    _engineStatus.phase = 'Processing';
+    await runWithConcurrency(pending, concurrency, item => processLink(item, config));
+  }
+
+  // ── Step 2: Scan for any new links ──────────────────────────────────────────
   _engineStatus.phase = 'Scanning';
-  console.log('[mirrorEngine] ── Phase 1: Scanning for MEGA links...');
-  appendSystemLog('INFO', 'Phase 1: Scanning for MEGA links...', 'mirrorEngine');
+  console.log('[mirrorEngine] ── Scanning for new MEGA links...');
+  appendSystemLog('INFO', 'Scanning for new MEGA links...', 'mirrorEngine');
   const found = await scanAllGuilds(config, _selfbot);
 
   let newCount = 0;
@@ -594,23 +609,18 @@ async function runEngine(config) {
     }
   }
 
-  const pending = Object.values(_state).filter(e => e.status === 'pending');
-  const done    = Object.values(_state).filter(e => e.status === 'done').length;
-  const failed  = Object.values(_state).filter(e => e.status === 'failed').length;
+  const remainingPending = Object.values(_state).filter(e => e.status === 'pending');
+  const doneCount        = Object.values(_state).filter(e => e.status === 'done').length;
+  const failedCount      = Object.values(_state).filter(e => e.status === 'failed').length;
 
-  console.log(`[mirrorEngine] Scan: ${newCount} new, ${pending.length} pending, ${done} done, ${failed} failed.`);
-  appendSystemLog('INFO', `Scan complete: ${newCount} new, ${pending.length} pending, ${done} done, ${failed} failed.`, 'mirrorEngine');
+  console.log(`[mirrorEngine] Scan: ${newCount} new, ${remainingPending.length} pending, ${doneCount} done, ${failedCount} failed.`);
+  appendSystemLog('INFO', `Scan complete: ${newCount} new, ${remainingPending.length} pending, ${doneCount} done, ${failedCount} failed.`, 'mirrorEngine');
 
-  if (pending.length === 0) {
-    console.log('[mirrorEngine] Nothing to do — all links processed.');
-    _engineStatus.phase = 'Done';
-    return;
+  if (remainingPending.length > 0) {
+    _engineStatus.phase = 'Processing';
+    console.log(`[mirrorEngine] ── Processing ${remainingPending.length} new pending link(s)...`);
+    await runWithConcurrency(remainingPending, concurrency, item => processLink(item, config));
   }
-
-  // ── Phase 2: Process ──────────────────────────────────────────────────────
-  _engineStatus.phase = 'Processing';
-  console.log(`[mirrorEngine] ── Phase 2: Processing ${pending.length} link(s) (concurrency=${concurrency})...`);
-  await runWithConcurrency(pending, concurrency, item => processLink(item, config));
 
   const fin = Object.values(_state).reduce((a, v) => { a[v.status] = (a[v.status]||0)+1; return a; }, {});
   console.log('[mirrorEngine] ── Done:', JSON.stringify(fin));

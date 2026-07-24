@@ -31,6 +31,7 @@ db.defaults({
   files: {},
   logs: [],
   systemLogs: [],
+  mirrorState: {},
   batchState: {
     dchecksRun: 0,
     currentBatchChannelId: null,
@@ -41,6 +42,15 @@ db.defaults({
 
 const emitter = new EventEmitter();
 emitter.setMaxListeners(50);
+
+function getMirrorStateDb() {
+  return db.get('mirrorState').value() || {};
+}
+
+function setMirrorStateDb(mirrorState) {
+  if (!mirrorState || typeof mirrorState !== 'object') return;
+  db.set('mirrorState', mirrorState).write();
+}
 
 function getState(filename) {
   return db.get(['files', filename]).value() || null;
@@ -214,4 +224,6 @@ module.exports = {
   getDbPath,
   exportStateArchive,
   importStateArchive,
+  getMirrorStateDb,
+  setMirrorStateDb,
 };
