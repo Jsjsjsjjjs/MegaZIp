@@ -55,7 +55,7 @@ const { updateState, getState, getAllStates, appendLog, removeState, getBatchSta
 const { startGuiServer } = require('./gui/server');
 const { startDownloadEngine, pauseDownloads, resumeDownloads, cancelDownloads } = require('./downloadEngine');
 const downloadManager    = require('./downloadEngine/downloadManager');
-const { startMirrorEngine, stopMirrorEngine, getMirrorEngineStatus, resetMirrorState } = require('./mirrorEngine');
+const { startMirrorEngine, stopMirrorEngine, getMirrorEngineStatus, resetMirrorState, getMirrorState, setMirrorState } = require('./mirrorEngine');
 const { parseTxtFile }   = require('./txtLinkIngester');
 const { retryWithBackoff } = require('./utils/retry');
 
@@ -535,6 +535,8 @@ async function main() {
       start:  () => startMirrorEngine(config),
       stop:   stopMirrorEngine,
       reset:  resetMirrorState,
+      getMirrorState,
+      setMirrorState,
     },
     pipelineControls: {
       pause:   pauseDownloads,
@@ -593,6 +595,8 @@ async function main() {
             start:  () => startMirrorEngine(config),
             stop:   stopMirrorEngine,
             reset:  resetMirrorState,
+            getMirrorState,
+            setMirrorState,
           },
           pipelineControls: {
             pause:   pauseDownloads,

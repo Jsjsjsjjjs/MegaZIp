@@ -5,7 +5,7 @@ const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
 
-const { getAllStates, appendSystemLog }  = require('./stateStore');
+const { getAllStates, appendSystemLog, exportStateArchive, importStateArchive } = require('./stateStore');
 const { editZipMessage }                 = require('./webhookSender');
 const { extractMegaLinks, flattenEmbed } = require('./downloadEngine/linkExtractor');
 
@@ -180,6 +180,26 @@ async function registerCommands(config) {
       .addStringOption(o =>
         o.setName('color')
           .setDescription('Embed side-bar color as hex (e.g. #5865F2)')
+          .setRequired(false)
+      )
+      .toJSON(),
+
+    // ── /sa — Export or import complete bot state archive ────────────────────
+    new SlashCommandBuilder()
+      .setName('sa')
+      .setDescription('Export or import complete state archive as Base64 code (owner only)')
+      .addStringOption(o =>
+        o.setName('action')
+          .setDescription('export = generate Base64 state backup; import = restore state from code')
+          .setRequired(false)
+          .addChoices(
+            { name: 'export', value: 'export' },
+            { name: 'import', value: 'import' },
+          )
+      )
+      .addStringOption(o =>
+        o.setName('code')
+          .setDescription('Base64 state archive string (required when action is import)')
           .setRequired(false)
       )
       .toJSON(),
@@ -783,6 +803,60 @@ function attachCommandHandler(client, config, {
         flags: MessageFlags.Ephemeral,
       });
       return;
+    }
+
+    // ── /sa — Save Archive / State Archive ───────────────────────────────────
+    if (cmd === 'sa') {
+      const action = interaction.options.getString('action') || 'export';
+      const code = interaction.options.getString('code');
+
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      if (action === 'export') {
+        const mirrorState = mirrorControls.getMirrorState ? mirrorControls.getMirrorState() : {};
+        const { payload, base64 } = exportStateArchive(mirrorState);
+
+        const fileCount = Object.keys(payload.filesState || {}).length;
+        const mirrorCount = Object.keys(payload.mirrorState || {}).length;
+        const batchNum = payload.batchState?.batchSeriesNumber || 0;
+
+        const header = `📦 **ZipBot State Archive Exported!**\n- Tracked Files: **${fileCount}**\n- Mirror Links: **${mirrorCount}**\n- Batch Series: **#${batchNum}**\n- Exported At: \`${payload.exportedAt}\``;
+
+        if (base64.length <= 1700) {
+          await interaction.editReply({
+            content: `${header}\n\n**Base64 State Code:**\n\`\`\`${base64}\`\`\``,
+          });
+        } else {
+          const buffer = Buffer.from(base64, 'utf-8');
+          const fileName = `mzb-state-archive-${Date.now()}.sa`;
+          await interaction.editReply({
+            content: `${header}\n\n⚠️ Base64 archive is ${(buffer.length / 1024).toFixed(1)} KB (exceeds single message length limit). Attached as \`${fileName}\`. Download or copy its text to restore via \`/sa action:import code:<text>\`.`,
+            files: [{ attachment: buffer, name: fileName }],
+          });
+        }
+        appendSystemLog('INFO', `State archive exported via /sa command (${(base64.length/1024).toFixed(1)} KB).`, 'commandHandler');
+        return;
+      }
+
+      if (action === 'import') {
+        if (!code) {
+          await interaction.editReply({ content: '❌ Please provide the `code:` option containing the Base64 state archive code.' });
+          return;
+        }
+
+        try {
+          const result = importStateArchive(code, mirrorControls.setMirrorState);
+          await interaction.editReply({
+            content: `✅ **State Archive Successfully Imported!**\n- Restored Pipeline Files: **${result.filesCount}**\n- Restored Mirror Links: **${result.mirrorCount}**\n- Export Date: \`${result.exportedAt || 'unknown'}\`\n\n🔄 Resuming processing...`,
+          });
+          appendSystemLog('WARN', `State archive imported via /sa (${result.filesCount} files, ${result.mirrorCount} mirror links).`, 'commandHandler');
+
+          if (mirrorControls.start) mirrorControls.start();
+        } catch (err) {
+          await interaction.editReply({ content: `❌ **Failed to import state archive:** ${err.message}` });
+        }
+        return;
+      }
     }
   });
 

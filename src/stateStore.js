@@ -10,7 +10,6 @@ const FileSync    = require('lowdb/adapters/FileSync');
 // Write state to /tmp which is always writable. Fall back to project root locally.
 function resolveStatePath() {
   const preferred = path.join(__dirname, '..', 'state.json');
-  // Test writability by checking if the parent dir is writable
   try {
     fs.accessSync(path.dirname(preferred), fs.constants.W_OK);
     return preferred;
@@ -41,15 +40,7 @@ db.defaults({
 }).write();
 
 const emitter = new EventEmitter();
-// Increase max listeners to avoid spurious warnings when many pipeline workers attach
 emitter.setMaxListeners(50);
-
-/**
- * NOTE: We always use ARRAY paths like ['files', filename] instead of the
- * dot-string form 'files.myzip.zip'. lowdb/lodash treats dot-strings as
- * nested paths, so a filename like "myzip.zip" would be misread as
- * files → myzip → zip. Array paths avoid that bug entirely.
- */
 
 function getState(filename) {
   return db.get(['files', filename]).value() || null;
@@ -112,7 +103,6 @@ function appendSystemLog(level, message, source = 'system') {
   };
   const logs = db.get('systemLogs').value() || [];
   logs.push(record);
-  // Keep last 500 system logs
   if (logs.length > 500) logs.shift();
   db.set('systemLogs', logs).write();
   emitter.emit('system-log', record);
@@ -145,6 +135,68 @@ function getDbPath() {
   return dbPath;
 }
 
+// ── State Archive Export / Import (/sa command) ──────────────────────────────
+function exportStateArchive(mirrorState = {}) {
+  const payload = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    filesState: db.get('files').value() || {},
+    batchState: getBatchState(),
+    logs: db.get('logs').value() || [],
+    mirrorState: mirrorState || {},
+  };
+  const json = JSON.stringify(payload);
+  const base64 = Buffer.from(json, 'utf-8').toString('base64');
+  return { payload, base64 };
+}
+
+function importStateArchive(base64Code, setMirrorStateFn) {
+  if (!base64Code || typeof base64Code !== 'string') {
+    throw new Error('Invalid Base64 code provided.');
+  }
+  let jsonString;
+  try {
+    jsonString = Buffer.from(base64Code.trim(), 'base64').toString('utf-8');
+  } catch {
+    throw new Error('Failed to decode Base64 string.');
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(jsonString);
+  } catch {
+    throw new Error('Invalid JSON inside decoded archive.');
+  }
+
+  if (!payload || typeof payload !== 'object' || !payload.filesState) {
+    throw new Error('Invalid state archive payload format.');
+  }
+
+  if (payload.filesState && typeof payload.filesState === 'object') {
+    db.set('files', payload.filesState).write();
+  }
+  if (payload.batchState && typeof payload.batchState === 'object') {
+    db.set('batchState', payload.batchState).write();
+  }
+  if (Array.isArray(payload.logs)) {
+    db.set('logs', payload.logs).write();
+  }
+
+  let mirrorCount = 0;
+  if (payload.mirrorState && typeof payload.mirrorState === 'object' && typeof setMirrorStateFn === 'function') {
+    mirrorCount = setMirrorStateFn(payload.mirrorState);
+  }
+
+  const filesCount = Object.keys(payload.filesState || {}).length;
+  appendSystemLog('WARN', `Imported state archive: ${filesCount} pipeline item(s), ${mirrorCount} mirror link(s) restored.`, 'stateStore');
+
+  return {
+    filesCount,
+    mirrorCount,
+    exportedAt: payload.exportedAt,
+  };
+}
+
 module.exports = {
   getState,
   updateState,
@@ -160,4 +212,6 @@ module.exports = {
   getBatchState,
   setBatchState,
   getDbPath,
+  exportStateArchive,
+  importStateArchive,
 };

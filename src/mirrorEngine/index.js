@@ -118,6 +118,17 @@ function setEntry(url, patch)  {
   saveState();
 }
 
+function getMirrorState() {
+  return { ..._state };
+}
+
+function setMirrorState(newState) {
+  if (!newState || typeof newState !== 'object') return 0;
+  _state = { ..._state, ...newState };
+  saveState();
+  return Object.keys(newState).length;
+}
+
 // ─── Encrypt a non-zip file directly into an AES-256 zip ─────────────────────
 async function encryptFileAsZip(rawFilePath, outputZipPath, password) {
   return new Promise((resolve, reject) => {
@@ -292,7 +303,6 @@ async function processLink(entry, config) {
       const waitSec = downloadManager.extractBandwidthWaitSeconds(err.message);
       console.warn(`[mirrorEngine] ⏳ Bandwidth limit hit for "${name}". Pausing engine for ${waitSec}s...`);
       appendSystemLog('WARN', `Bandwidth limit hit processing "${name}". Engine paused for ${waitSec}s (${(waitSec / 3600).toFixed(2)} hrs). Item kept in queue.`, 'mirrorEngine');
-      // Keep entry in pending status so it retries automatically on reset!
       setEntry(link, { status: 'pending', error: `Bandwidth limit reached — auto-resuming in ${waitSec}s` });
       bandwidthManager.triggerPause(waitSec, 'mirrorEngine');
     } else {
@@ -339,7 +349,7 @@ async function scanChannel(channel, timeoutMs) {
       const text = msg.content || '';
       for (const link of extractMegaLinks(text)) {
         const msgName = extractSuggestedName(text) || channelName;
-        results.push({ link, name: msgName, categoryName });
+        results.push({ link, name: msgName, categoryName, channelId: channel.id, guildId: channel.guild.id });
       }
 
       if (Array.isArray(msg.embeds)) {
@@ -347,7 +357,7 @@ async function scanChannel(channel, timeoutMs) {
           const embedText = flattenEmbed(embed);
           for (const link of extractMegaLinks(embedText)) {
             const embedName = extractSuggestedName(embedText) || embed.title || channelName;
-            results.push({ link, name: embedName, categoryName });
+            results.push({ link, name: embedName, categoryName, channelId: channel.id, guildId: channel.guild.id });
           }
         }
       }
@@ -413,7 +423,7 @@ async function scanAllGuilds(config, selfbot) {
   return all;
 }
 
-// ─── Concurrency pool with bandwidth limit pause support ─────────────────────
+// ─── Concurrency pool with deadlock safety watchdog ─────────────────────────
 async function runWithConcurrency(items, concurrency, fn) {
   const total = items.length;
   let completed = 0;
@@ -424,18 +434,23 @@ async function runWithConcurrency(items, concurrency, fn) {
     function dispatch() {
       if (bandwidthManager.isPaused()) {
         const rem = bandwidthManager.getRemainingSeconds();
-        console.log(`[mirrorEngine] Bandwidth pause active (${rem}s remaining). Concurrency dispatcher waiting...`);
+        console.log(`[mirrorEngine] Bandwidth pause active (${rem}s remaining). Dispatcher waiting...`);
         bandwidthManager.waitUntilResumed().then(() => dispatch());
         return;
       }
 
       while (idx < items.length && active < concurrency) {
-        if (bandwidthManager.isPaused()) break;
+        if (bandwidthManager.isPaused()) {
+          bandwidthManager.waitUntilResumed().then(() => dispatch());
+          break;
+        }
 
         const item = items[idx++];
         active++;
         fn(item)
-          .catch(() => {})
+          .catch((err) => {
+            console.error(`[mirrorEngine] Worker error: ${err?.message || err}`);
+          })
           .finally(() => {
             active--;
             completed++;
@@ -450,6 +465,19 @@ async function runWithConcurrency(items, concurrency, fn) {
     }
 
     if (items.length === 0) { resolve(); return; }
+
+    // Watchdog to prevent queue deadlock when space or bandwidth opens up
+    const watchdog = setInterval(() => {
+      if (completed === total) {
+        clearInterval(watchdog);
+        return;
+      }
+      if (active === 0 && idx < items.length && !bandwidthManager.isPaused()) {
+        console.warn('[mirrorEngine] Watchdog: Dispatcher stalled — auto-kicking queue dispatch...');
+        dispatch();
+      }
+    }, 4000);
+
     dispatch();
   });
 }
@@ -547,9 +575,21 @@ async function runEngine(config) {
   const found = await scanAllGuilds(config, _selfbot);
 
   let newCount = 0;
-  for (const { link, name, categoryName } of found) {
+  for (const { link, name, categoryName, channelId, guildId } of found) {
     if (!getEntry(link)) {
-      setEntry(link, { link, name, categoryName, status: 'pending', megaLink: null, password: null, channelId: null, messageId: null, error: null });
+      setEntry(link, {
+        link,
+        name,
+        categoryName,
+        sourceChannelId: channelId || null,
+        sourceGuildId: guildId || null,
+        status: 'pending',
+        megaLink: null,
+        password: null,
+        channelId: null,
+        messageId: null,
+        error: null,
+      });
       newCount++;
     }
   }
@@ -594,4 +634,11 @@ function resetMirrorState() {
   return count;
 }
 
-module.exports = { startMirrorEngine, stopMirrorEngine, getMirrorEngineStatus, resetMirrorState };
+module.exports = {
+  startMirrorEngine,
+  stopMirrorEngine,
+  getMirrorEngineStatus,
+  resetMirrorState,
+  getMirrorState,
+  setMirrorState,
+};

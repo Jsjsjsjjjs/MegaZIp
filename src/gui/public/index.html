@@ -467,6 +467,19 @@
           </div>
         </div>
 
+        <!-- State Archive Backup & Restore (/sa) -->
+        <div class="card">
+          <div class="card-title">
+            <span>📦 State Archive (`/sa`)</span>
+            <span style="font-size:12px;color:var(--text3)">Checkpoint Backup</span>
+          </div>
+          <p style="font-size:12.5px;color:var(--text2);margin-bottom:14px;">Export or import complete bot state as Base64 code to preserve scanning and queue progress.</p>
+          <div class="btn-group">
+            <button class="btn btn-primary" onclick="exportStateArchiveGui()">📥 Export Base64 Code</button>
+            <button class="btn btn-warning" onclick="importStateArchiveGui()">📤 Import Base64 Code</button>
+          </div>
+        </div>
+
       </div>
 
       <!-- Real-time Telemetry Stats Bar -->
@@ -837,6 +850,40 @@ async function clearBandwidthPause() {
   });
   if (res.ok) toast('Bandwidth pause cleared!', 'success');
   fetchTelemetry();
+}
+
+async function exportStateArchiveGui() {
+  toast('Exporting state archive...', 'info');
+  try {
+    const res = await fetch('/api/control/state-archive');
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Export failed');
+    const code = data.base64;
+    navigator.clipboard.writeText(code);
+    toast('State Base64 code copied to clipboard!', 'success');
+    alert(`📦 State Archive Base64 Code (Copied to Clipboard):\n\n${code.slice(0, 300)}...`);
+  } catch (err) {
+    toast(err.message, 'error');
+  }
+}
+
+async function importStateArchiveGui() {
+  const code = prompt('Paste the Base64 State Archive code to restore progress:');
+  if (!code || !code.trim()) return;
+  toast('Importing state archive...', 'info');
+  try {
+    const res = await fetch('/api/control/state-archive', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ base64: code.trim() }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Import failed');
+    toast(`State restored! Restored ${data.result.filesCount} pipeline files and ${data.result.mirrorCount} mirror links.`, 'success');
+    fetchTelemetry();
+  } catch (err) {
+    toast(err.message, 'error');
+  }
 }
 
 async function resetFailed() {

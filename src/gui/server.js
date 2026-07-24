@@ -12,6 +12,8 @@ const {
   clearSystemLogs,
   appendSystemLog,
   getDbPath,
+  exportStateArchive,
+  importStateArchive,
 } = require('../stateStore');
 const bandwidthManager = require('../utils/bandwidthManager');
 
@@ -256,6 +258,32 @@ function startGuiServer(config, handlers = {}) {
       res.json({ ok: true, shrunk: result.shrunk || 0, details: result.details || [] });
     } catch (err) {
       appendSystemLog('ERROR', `Shrink failed: ${err.message}`, 'gui');
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // State Archive Export GET (/sa)
+  app.get('/api/control/state-archive', (req, res) => {
+    try {
+      const mirrorState = mirrorControls.getMirrorState ? mirrorControls.getMirrorState() : {};
+      const { payload, base64 } = exportStateArchive(mirrorState);
+      res.json({ ok: true, payload, base64 });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // State Archive Import POST (/sa)
+  app.post('/api/control/state-archive', (req, res) => {
+    const { base64 } = req.body || {};
+    if (!base64 || typeof base64 !== 'string') {
+      return res.status(400).json({ error: 'base64 code string is required.' });
+    }
+    try {
+      const result = importStateArchive(base64, mirrorControls.setMirrorState);
+      if (mirrorControls.start) mirrorControls.start();
+      res.json({ ok: true, result });
+    } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
