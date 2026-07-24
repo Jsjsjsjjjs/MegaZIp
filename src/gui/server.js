@@ -280,6 +280,7 @@ function startGuiServer(config, handlers = {}) {
       return res.status(400).json({ error: 'base64 code string is required.' });
     }
     try {
+      if (mirrorControls.stop) mirrorControls.stop();
       const result = importStateArchive(base64, mirrorControls.setMirrorState);
       if (mirrorControls.start) mirrorControls.start();
       res.json({ ok: true, result });
@@ -300,6 +301,7 @@ function startGuiServer(config, handlers = {}) {
       const guild = await botClient.guilds.fetch(config.guildId);
 
       appendSystemLog('INFO', 'Triggering target guild state recovery...', 'gui');
+      if (mirrorControls.stop) mirrorControls.stop();
       const result = await mirrorControls.recoverStateFromTargetGuild(guild, config, lastchannel);
       if (mirrorControls.start) mirrorControls.start();
       res.json({ ok: true, result });

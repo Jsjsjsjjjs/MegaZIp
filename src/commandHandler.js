@@ -881,6 +881,8 @@ function attachCommandHandler(client, config, {
           throw new Error('Recovery function not available.');
         }
 
+        if (mirrorControls.stop) mirrorControls.stop();
+
         const result = await mirrorControls.recoverStateFromTargetGuild(guild, config, channelOpt);
         const resolvedText = result.targetChannelName ? `Resolved Checkpoint: \`#${result.targetChannelName}\`` : 'Auto-scanned target channels';
 
