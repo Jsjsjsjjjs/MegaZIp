@@ -644,10 +644,8 @@ function resetMirrorState() {
   return count;
 }
 
-// ─── Target Guild State Recovery ─────────────────────────────────────────────
+// ─── Target Guild State Recovery (Blazing Fast Checkpoint Matching) ───────────
 async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
-  await guild.channels.fetch();
-
   loadState();
 
   let targetChannelName = null;
@@ -660,10 +658,10 @@ async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
     if (idMatch) {
       targetChannelId = idMatch[0];
       try {
-        const ch = await guild.channels.fetch(targetChannelId);
+        const ch = guild.channels.cache.get(targetChannelId) || await guild.channels.fetch(targetChannelId);
         if (ch) targetChannelName = ch.name;
       } catch (err) {
-        console.warn(`[mirrorEngine] Target channel ID ${targetChannelId} not found in guild: ${err.message}`);
+        console.warn(`[mirrorEngine] Target channel ID ${targetChannelId} fetch warning: ${err.message}`);
       }
     }
     if (!targetChannelName) {
@@ -671,48 +669,20 @@ async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
     }
   }
 
-  console.log(`[mirrorEngine] Starting target state recovery... (Channel input: "${channelInput || 'auto-scan'}", Resolved name: "${targetChannelName || 'all'}")`);
+  console.log(`[mirrorEngine] Fast target state recovery starting... (Channel input: "${channelInput || 'auto-scan'}", Resolved name: "${targetChannelName || 'all'}")`);
 
   let recoveredCount = 0;
-  const textChannels = guild.channels.cache.filter(c => c.type === 0 || c.type === 'GUILD_TEXT');
 
-  // 1. Scan target channels to match posted links directly
-  for (const channel of textChannels.values()) {
-    try {
-      const msgs = await channel.messages.fetch({ limit: 10 });
-      for (const msg of msgs.values()) {
-        const text = (msg.content || '') + ' ' + (msg.embeds ? msg.embeds.map(flattenEmbed).join(' ') : '');
-        const links = extractMegaLinks(text);
-
-        for (const megaLink of links) {
-          const k = linkKey(megaLink);
-          if (_state[k] && _state[k].status !== 'done') {
-            _state[k] = {
-              ..._state[k],
-              status: 'done',
-              channelId: channel.id,
-              messageId: msg.id,
-              megaLink,
-              error: null,
-              lastUpdated: new Date().toISOString(),
-            };
-            recoveredCount++;
-          }
-        }
-      }
-    } catch {}
-  }
-
-  // 2. If targetChannelName is resolved, find matching channel/entry in source state and mark all items up to it as done
-  if (targetChannelName) {
-    const filterNorm = targetChannelName.normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
+  // 1. If a channel checkpoint was provided, run INSTANT in-memory state checkpoint matching (< 100ms)
+  if (targetChannelName || targetChannelId) {
+    const filterNorm = (targetChannelName || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
     let hitMatch = false;
 
     for (const [k, entry] of Object.entries(_state)) {
       const entryNameNorm = (entry.name || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
       const entryChanId = entry.sourceChannelId || entry.channelId || '';
 
-      const isNameMatch = entryNameNorm && (entryNameNorm === filterNorm || entryNameNorm.includes(filterNorm) || filterNorm.includes(entryNameNorm));
+      const isNameMatch = filterNorm && entryNameNorm && (entryNameNorm === filterNorm || entryNameNorm.includes(filterNorm) || filterNorm.includes(entryNameNorm));
       const isIdMatch = targetChannelId && entryChanId === targetChannelId;
 
       if (isNameMatch || isIdMatch) {
@@ -721,7 +691,7 @@ async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
           _state[k] = { ...entry, status: 'done', lastUpdated: new Date().toISOString() };
           recoveredCount++;
         }
-        break; // Stop marking once we reach the target channel checkpoint!
+        break; // Stop marking once we reach the checkpoint channel!
       }
 
       if (!hitMatch && entry.status === 'pending') {
@@ -729,14 +699,48 @@ async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
         recoveredCount++;
       }
     }
+  } else {
+    // 2. If no channel input was provided, scan target channels in parallel batches (fast scan)
+    await guild.channels.fetch();
+    const textChannels = [...guild.channels.cache.filter(c => c.type === 0 || c.type === 'GUILD_TEXT').values()];
+    const BATCH_SIZE = 15;
+
+    for (let i = 0; i < textChannels.length; i += BATCH_SIZE) {
+      const batch = textChannels.slice(i, i + BATCH_SIZE);
+      await Promise.allSettled(batch.map(async (channel) => {
+        try {
+          const msgs = await channel.messages.fetch({ limit: 5 });
+          for (const msg of msgs.values()) {
+            const text = (msg.content || '') + ' ' + (msg.embeds ? msg.embeds.map(flattenEmbed).join(' ') : '');
+            const links = extractMegaLinks(text);
+
+            for (const megaLink of links) {
+              const k = linkKey(megaLink);
+              if (_state[k] && _state[k].status !== 'done') {
+                _state[k] = {
+                  ..._state[k],
+                  status: 'done',
+                  channelId: channel.id,
+                  messageId: msg.id,
+                  megaLink,
+                  error: null,
+                  lastUpdated: new Date().toISOString(),
+                };
+                recoveredCount++;
+              }
+            }
+          }
+        } catch {}
+      }));
+    }
   }
 
   saveState();
-  appendSystemLog('WARN', `Target server state recovery complete: ${recoveredCount} item(s) marked done up to "${targetChannelName || 'auto'}".`, 'mirrorEngine');
+  appendSystemLog('WARN', `Fast state recovery complete: ${recoveredCount} item(s) marked done up to "${targetChannelName || 'auto'}".`, 'mirrorEngine');
 
   return {
     recoveredCount,
-    totalTargetChannels: textChannels.size,
+    totalTargetChannels: guild.channels.cache.size || 0,
     targetChannelName: targetChannelName || null,
   };
 }
