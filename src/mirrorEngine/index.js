@@ -69,6 +69,7 @@ function linkKey(url) {
 // ─── State ────────────────────────────────────────────────────────────────────
 let _state   = {}; // { [linkKey]: LinkEntry }
 let _started = false;
+let _aborted = false; // Bug Fix 3: abort flag to cleanly stop mid-run
 let _selfbot = null;
 
 // ─── Live engine status ────────────────────────────────────────────────────────
@@ -98,7 +99,7 @@ function loadState() {
   } catch {
     _state = {};
   }
-  // Fallback and merge with lowdb mirrorState to guarantee zero state loss across container restarts
+  // Fallback: merge with lowdb mirrorState to guarantee zero state loss across container restarts
   const dbMirrorState = getMirrorStateDb();
   _state = { ...dbMirrorState, ..._state };
 }
@@ -155,12 +156,20 @@ async function encryptFileAsZip(rawFilePath, outputZipPath, password) {
 
 // ─── Per-link pipeline ────────────────────────────────────────────────────────
 async function processLink(entry, config) {
+  // Bug Fix 3: Check abort flag before starting any work
+  if (_aborted) return;
+
   // If bandwidth limit is currently active, wait until it resets
   if (bandwidthManager.isPaused()) {
     await bandwidthManager.waitUntilResumed();
   }
 
-  const { link, name, categoryName } = entry;
+  // Check abort again after potential long wait
+  if (_aborted) return;
+
+  const { link, name, displayName, categoryName } = entry;
+  // Bug Fix 1: use displayName if available (includes suffix for multi-link channels), fallback to name
+  const effectiveName = displayName || name;
   const mc = config.mirrorEngine;
   const sourcePassword = mc.sourcePassword || null;
   const outputPassword = generatePassword(12);
@@ -184,10 +193,10 @@ async function processLink(entry, config) {
       throw new Error(`Download: ${err.message}`);
     }
 
-    const baseName = remoteName
-      ? path.basename(remoteName, path.extname(remoteName))
-      : safeName(name);
+    // Check abort after slow download
+    if (_aborted) return;
 
+    const baseName = safeName(effectiveName);
     const remoteExt = remoteName ? path.extname(remoteName).toLowerCase() : '';
     const isZip     = remoteExt === '.zip';
 
@@ -223,6 +232,8 @@ async function processLink(entry, config) {
       }
     }
 
+    if (_aborted) return;
+
     // ── 3. Upload to MEGA ──────────────────────────────────────────────────
     setEntry(link, { status: 'uploading' });
     console.log(`[mirrorEngine] ↑ ${baseName}`);
@@ -234,6 +245,8 @@ async function processLink(entry, config) {
     } catch (err) {
       throw new Error(`Upload: ${err.message}`);
     }
+
+    if (_aborted) return;
 
     // ── 4. Create Discord channel (with cloned category) ──────────────────
     const existingEntry = getEntry(link);
@@ -264,6 +277,8 @@ async function processLink(entry, config) {
         throw new Error(`Channel: ${err.message}`);
       }
     }
+
+    if (_aborted) return;
 
     // ── 5. Send message ────────────────────────────────────────────────────
     try {
@@ -307,13 +322,13 @@ async function processLink(entry, config) {
   } catch (err) {
     if (downloadManager.isBandwidthError(err)) {
       const waitSec = downloadManager.extractBandwidthWaitSeconds(err.message);
-      console.warn(`[mirrorEngine] ⏳ Bandwidth limit hit for "${name}". Pausing engine for ${waitSec}s...`);
-      appendSystemLog('WARN', `Bandwidth limit hit processing "${name}". Engine paused for ${waitSec}s (${(waitSec / 3600).toFixed(2)} hrs). Item kept in queue.`, 'mirrorEngine');
+      console.warn(`[mirrorEngine] ⏳ Bandwidth limit hit for "${effectiveName}". Pausing engine for ${waitSec}s...`);
+      appendSystemLog('WARN', `Bandwidth limit hit processing "${effectiveName}". Engine paused for ${waitSec}s (${(waitSec / 3600).toFixed(2)} hrs). Item kept in queue.`, 'mirrorEngine');
       setEntry(link, { status: 'pending', error: `Bandwidth limit reached — auto-resuming in ${waitSec}s` });
       bandwidthManager.triggerPause(waitSec, 'mirrorEngine');
     } else {
-      console.error(`[mirrorEngine] ✗ ${name}: ${err.message}`);
-      appendSystemLog('ERROR', `Mirror failed for "${name}": ${err.message}`, 'mirrorEngine');
+      console.error(`[mirrorEngine] ✗ ${effectiveName}: ${err.message}`);
+      appendSystemLog('ERROR', `Mirror failed for "${effectiveName}": ${err.message}`, 'mirrorEngine');
       setEntry(link, { status: 'failed', error: err.message });
     }
   } finally {
@@ -392,6 +407,7 @@ async function scanAllGuilds(config, selfbot) {
   const all = [];
 
   for (const guild of guilds) {
+    if (_aborted) break;
     console.log(`[mirrorEngine] ── Guild: ${guild.name}`);
 
     let chCollection;
@@ -406,6 +422,7 @@ async function scanAllGuilds(config, selfbot) {
     console.log(`[mirrorEngine]   ${total} text channel(s) to scan`);
 
     for (let i = 0; i < channels.length; i += BATCH) {
+      if (_aborted) break;
       const batch     = channels.slice(i, i + BATCH);
       const batchNum  = Math.floor(i / BATCH) + 1;
       const batchTotal = Math.ceil(total / BATCH);
@@ -429,7 +446,7 @@ async function scanAllGuilds(config, selfbot) {
   return all;
 }
 
-// ─── Concurrency pool with deadlock safety watchdog ─────────────────────────
+// ─── Concurrency pool with abort and deadlock-safety watchdog ────────────────
 async function runWithConcurrency(items, concurrency, fn) {
   const total = items.length;
   let completed = 0;
@@ -438,6 +455,12 @@ async function runWithConcurrency(items, concurrency, fn) {
 
   return new Promise((resolve) => {
     function dispatch() {
+      // Bug Fix 3: Stop dispatching new work if aborted
+      if (_aborted) {
+        if (active === 0) resolve();
+        return;
+      }
+
       if (bandwidthManager.isPaused()) {
         const rem = bandwidthManager.getRemainingSeconds();
         console.log(`[mirrorEngine] Bandwidth pause active (${rem}s remaining). Dispatcher waiting...`);
@@ -446,6 +469,7 @@ async function runWithConcurrency(items, concurrency, fn) {
       }
 
       while (idx < items.length && active < concurrency) {
+        if (_aborted) break;
         if (bandwidthManager.isPaused()) {
           bandwidthManager.waitUntilResumed().then(() => dispatch());
           break;
@@ -462,7 +486,7 @@ async function runWithConcurrency(items, concurrency, fn) {
             completed++;
             _engineStatus.done = completed;
             _engineStatus.total = total;
-            console.log(`[mirrorEngine] Progress: ${completed}/${total}`);
+            if (!_aborted) console.log(`[mirrorEngine] Progress: ${completed}/${total}`);
             dispatch();
             if (completed === total && active === 0) resolve();
           });
@@ -472,13 +496,13 @@ async function runWithConcurrency(items, concurrency, fn) {
 
     if (items.length === 0) { resolve(); return; }
 
-    // Watchdog to prevent queue deadlock when space or bandwidth opens up
+    // Watchdog: prevent queue deadlock when space or bandwidth opens up
     const watchdog = setInterval(() => {
-      if (completed === total) {
+      if (completed === total || _aborted) {
         clearInterval(watchdog);
         return;
       }
-      if (active === 0 && idx < items.length && !bandwidthManager.isPaused()) {
+      if (active === 0 && idx < items.length && !bandwidthManager.isPaused() && !_aborted) {
         console.warn('[mirrorEngine] Watchdog: Dispatcher stalled — auto-kicking queue dispatch...');
         dispatch();
       }
@@ -536,6 +560,7 @@ function startMirrorEngine(config) {
 
   _selfbot = new SelfbotClient({ checkUpdate: false });
   _started = true;
+  _aborted = false; // Bug Fix 3: reset abort flag on fresh start
 
   _selfbot.on('error', e => console.error('[mirrorEngine] Selfbot error:', e.message));
 
@@ -546,8 +571,10 @@ function startMirrorEngine(config) {
     try {
       await runEngine(config);
     } catch (e) {
-      console.error('[mirrorEngine] Fatal:', e.message);
-      appendSystemLog('ERROR', `Mirror engine fatal error: ${e.message}`, 'mirrorEngine');
+      if (!_aborted) {
+        console.error('[mirrorEngine] Fatal:', e.message);
+        appendSystemLog('ERROR', `Mirror engine fatal error: ${e.message}`, 'mirrorEngine');
+      }
     } finally {
       _started = false;
       _engineStatus.running = false;
@@ -567,6 +594,37 @@ function startMirrorEngine(config) {
   });
 }
 
+// ─── Bug Fix 1: Build unique display names for multi-link source channels ─────
+/**
+ * When a source channel has >1 MEGA link, each link needs a unique Discord
+ * channel name so they don't all collapse into the same target channel.
+ *
+ * Strategy: track how many links we've seen per sourceChannelId.
+ * - First link: displayName = channelName  (unchanged)
+ * - Second link: displayName = "channelName (2)"
+ * - Third link: displayName = "channelName (3)"
+ * - etc.
+ */
+function assignUniqueDisplayNames(foundLinks) {
+  // Count occurrences per sourceChannelId
+  const channelLinkCount = new Map(); // channelId -> number of links seen so far
+
+  return foundLinks.map(entry => {
+    const chanId = entry.channelId;
+    const prev = channelLinkCount.get(chanId) || 0;
+    const next = prev + 1;
+    channelLinkCount.set(chanId, next);
+
+    let displayName = entry.name;
+    if (next > 1) {
+      // Suffix to ensure uniqueness
+      displayName = `${entry.name} (${next})`;
+    }
+
+    return { ...entry, displayName };
+  });
+}
+
 async function runEngine(config) {
   const mc          = config.mirrorEngine;
   const concurrency = Math.max(1, mc.concurrency || 4);
@@ -583,18 +641,26 @@ async function runEngine(config) {
     await runWithConcurrency(pending, concurrency, item => processLink(item, config));
   }
 
+  if (_aborted) return;
+
   // ── Step 2: Scan for any new links ──────────────────────────────────────────
   _engineStatus.phase = 'Scanning';
   console.log('[mirrorEngine] ── Scanning for new MEGA links...');
   appendSystemLog('INFO', 'Scanning for new MEGA links...', 'mirrorEngine');
   const found = await scanAllGuilds(config, _selfbot);
 
+  if (_aborted) return;
+
+  // Bug Fix 1: Assign unique display names before adding to state
+  const foundWithNames = assignUniqueDisplayNames(found);
+
   let newCount = 0;
-  for (const { link, name, categoryName, channelId, guildId } of found) {
+  for (const { link, name, displayName, categoryName, channelId, guildId } of foundWithNames) {
     if (!getEntry(link)) {
       setEntry(link, {
         link,
         name,
+        displayName,   // unique per-link name for Discord channel creation
         categoryName,
         sourceChannelId: channelId || null,
         sourceGuildId: guildId || null,
@@ -616,7 +682,7 @@ async function runEngine(config) {
   console.log(`[mirrorEngine] Scan: ${newCount} new, ${remainingPending.length} pending, ${doneCount} done, ${failedCount} failed.`);
   appendSystemLog('INFO', `Scan complete: ${newCount} new, ${remainingPending.length} pending, ${doneCount} done, ${failedCount} failed.`, 'mirrorEngine');
 
-  if (remainingPending.length > 0) {
+  if (remainingPending.length > 0 && !_aborted) {
     _engineStatus.phase = 'Processing';
     console.log(`[mirrorEngine] ── Processing ${remainingPending.length} new pending link(s)...`);
     await runWithConcurrency(remainingPending, concurrency, item => processLink(item, config));
@@ -628,11 +694,14 @@ async function runEngine(config) {
 }
 
 function stopMirrorEngine() {
+  // Bug Fix 3: Set abort flag FIRST so all in-flight work stops at the next checkpoint
+  _aborted = true;
   _started = false;
   _engineStatus.running = false;
   _engineStatus.phase   = null;
   if (_selfbot) { _selfbot.destroy(); _selfbot = null; }
   appendSystemLog('INFO', 'Mirror engine manually stopped.', 'mirrorEngine');
+  console.log('[mirrorEngine] Engine stopped (aborted).');
 }
 
 function resetMirrorState() {
@@ -644,7 +713,7 @@ function resetMirrorState() {
   return count;
 }
 
-// ─── Target Guild State Recovery (100% Exact Target Channel Matching) ────────
+// ─── Target Guild State Recovery (Exact channel name matching) ───────────────
 async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
   await guild.channels.fetch();
   loadState();
@@ -669,51 +738,67 @@ async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
     }
   }
 
-  // 1. Build a lookup set of all normalized text channel names existing in the target server
+  // 1. Build lookup set of ALL normalized text channel names that exist in the target server right now
   const existingTargetChannelNames = new Set();
   for (const ch of guild.channels.cache.values()) {
     if (ch.type === 0 || ch.type === 'GUILD_TEXT') {
       const norm = ch.name.normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
-      if (norm) existingTargetChannelNames.add(norm);
+      if (norm && norm.length >= 2) existingTargetChannelNames.add(norm); // Bug Fix 2: skip too-short names
     }
   }
 
   console.log(`[mirrorEngine] Target state recovery: Found ${existingTargetChannelNames.size} existing text channel(s) in target guild "${guild.name}".`);
 
-  // 2. If a specific checkpoint target channel was provided, find its index in _state
+  // 2. If checkpoint channel provided, find its index in state
   const entriesArray = Object.entries(_state);
   let checkpointIndex = -1;
 
   if (targetChannelName) {
     const filterNorm = targetChannelName.normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
-    checkpointIndex = entriesArray.findIndex(([k, entry]) => {
-      const entryNorm = (entry.name || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
-      const entryChanId = entry.sourceChannelId || entry.channelId || '';
-      return (filterNorm && entryNorm && (entryNorm === filterNorm || entryNorm.includes(filterNorm) || filterNorm.includes(entryNorm))) ||
-             (targetChannelId && entryChanId === targetChannelId);
-    });
+
+    // Bug Fix 2: Only match if filterNorm is meaningful (at least 3 chars)
+    if (filterNorm.length >= 3) {
+      checkpointIndex = entriesArray.findIndex(([, entry]) => {
+        const entryNorm = (entry.name || entry.displayName || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const entryChanId = entry.sourceChannelId || entry.channelId || '';
+
+        // Bug Fix 2: Require both strings to be non-empty and meaningful before doing includes()
+        const isNameMatch = entryNorm.length >= 3 && (
+          entryNorm === filterNorm ||
+          (filterNorm.length >= 4 && entryNorm.includes(filterNorm)) ||
+          (entryNorm.length >= 4 && filterNorm.includes(entryNorm))
+        );
+        const isIdMatch = targetChannelId && entryChanId === targetChannelId;
+
+        return isNameMatch || isIdMatch;
+      });
+    }
   }
 
   let recoveredCount = 0;
   let resetToPendingCount = 0;
 
-  // 3. Process _state entries:
-  // Otherwise, mark an item as done ONLY IF its name matches an existing target channel in guild!
+  // 3. For each entry: mark done if it's before/at checkpoint OR its channel exists in target server.
+  //    Reset to pending if channel is NOT in target server and it's after the checkpoint.
   entriesArray.forEach(([k, entry], idx) => {
-    const entryNorm = (entry.name || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const existsInTargetGuild = existingTargetChannelNames.has(entryNorm);
+    const entryNorm = (entry.name || entry.displayName || '').normalize('NFKD').toLowerCase().replace(/[^a-z0-9]/g, '');
 
-    const shouldMarkDone = (checkpointIndex !== -1 && idx <= checkpointIndex) || existsInTargetGuild;
+    // Bug Fix 2: Only match against target channel names if entryNorm is meaningful
+    const existsInTargetGuild = entryNorm.length >= 2 && existingTargetChannelNames.has(entryNorm);
 
-    if (shouldMarkDone) {
+    const isBeforeOrAtCheckpoint = checkpointIndex !== -1 && idx <= checkpointIndex;
+    const shouldBeDone = isBeforeOrAtCheckpoint || existsInTargetGuild;
+
+    if (shouldBeDone) {
       if (entry.status !== 'done') {
         _state[k] = { ...entry, status: 'done', lastUpdated: new Date().toISOString() };
         recoveredCount++;
       }
     } else {
-      // If channel does not exist in target server and is after checkpoint, keep as pending!
-      if (entry.status === 'done' && !existsInTargetGuild && checkpointIndex !== -1 && idx > checkpointIndex) {
-        _state[k] = { ...entry, status: 'pending', lastUpdated: new Date().toISOString() };
+      // Channel does NOT exist in target server: reset back to pending
+      if (entry.status !== 'pending') {
+        _state[k] = { ...entry, status: 'pending', error: null, lastUpdated: new Date().toISOString() };
+        resetToPendingCount++;
       }
     }
   });
@@ -723,11 +808,12 @@ async function recoverStateFromTargetGuild(guild, config, channelInput = null) {
   const finalPending = Object.values(_state).filter(e => e.status === 'pending').length;
   const finalDone    = Object.values(_state).filter(e => e.status === 'done').length;
 
-  appendSystemLog('WARN', `State recovery complete: ${recoveredCount} marked done. Total done: ${finalDone}, pending remaining: ${finalPending}.`, 'mirrorEngine');
+  appendSystemLog('WARN', `State recovery complete: ${recoveredCount} marked done, ${resetToPendingCount} reset to pending. Done: ${finalDone}, Pending: ${finalPending}.`, 'mirrorEngine');
 
   return {
     recoveredCount,
-    totalTargetChannels: guild.channels.cache.size || 0,
+    resetToPendingCount,
+    totalTargetChannels: existingTargetChannelNames.size,
     targetChannelName: targetChannelName || null,
     finalDone,
     finalPending,
