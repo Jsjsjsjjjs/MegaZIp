@@ -632,13 +632,55 @@ function attachCommandHandler(client, config, {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       try {
-        let startScan;
-        try { startScan = require('./mirrorEngine/scanner').startScan; } catch {
-          await interaction.editReply({ content: '❌ Scanner module (`mirrorEngine/scanner.js`) not found.' }); return;
+        let found = [];
+        const { Client: SelfbotClient } = require('discord.js-selfbot-v13');
+        const mc = config.mirrorEngine || {};
+        if (!mc.userToken) {
+          await interaction.editReply({ content: '❌ `userToken` missing in mirrorEngine configuration.' });
+          return;
         }
-        await interaction.editReply({ content: '🔍 Scanning source server for MEGA links…' });
 
-        const found = await startScan(config); // returns [{link, name, categoryName}]
+        await interaction.editReply({ content: '🔍 Logging in selfbot to scan source server for MEGA links…' });
+        const selfbot = new SelfbotClient({ checkUpdate: false });
+        
+        await new Promise((resolve, reject) => {
+          selfbot.once('ready', async () => {
+            try {
+              const srcGuildIds = Array.isArray(mc.sourceGuildIds) ? mc.sourceGuildIds : [];
+              let guilds = srcGuildIds.length
+                ? srcGuildIds.map(id => selfbot.guilds.cache.get(id)).filter(Boolean)
+                : [...selfbot.guilds.cache.values()];
+
+              const { extractMegaLinks, extractSuggestedName, flattenEmbed } = require('./downloadEngine/linkExtractor');
+
+              for (const guild of guilds) {
+                const chCollection = await guild.channels.fetch();
+                const channels = [...chCollection.values()].filter(ch => ch && typeof ch.messages?.fetch === 'function');
+                for (const ch of channels) {
+                  try {
+                    const msgs = await ch.messages.fetch({ limit: 50 });
+                    for (const msg of msgs.values()) {
+                      for (const link of extractMegaLinks(msg.content || '')) {
+                        found.push({ link, name: extractSuggestedName(msg.content) || ch.name, categoryName: ch.parent?.name || '' });
+                      }
+                      for (const embed of msg.embeds || []) {
+                        const txt = flattenEmbed(embed);
+                        for (const link of extractMegaLinks(txt)) {
+                          found.push({ link, name: extractSuggestedName(txt) || embed.title || ch.name, categoryName: ch.parent?.name || '' });
+                        }
+                      }
+                    }
+                  } catch {}
+                }
+              }
+              resolve();
+            } catch (err) { reject(err); }
+            finally { selfbot.destroy(); }
+          });
+
+          selfbot.once('error', err => { selfbot.destroy(); reject(err); });
+          selfbot.login(mc.userToken).catch(reject);
+        });
         if (!found || found.length === 0) {
           await interaction.editReply({ content: '⚠️ No MEGA links found in source server.' });
           return;

@@ -120,6 +120,13 @@ if (process.env.ZIP_INPUT_PASSWORD)
   config.zipInputPassword = process.env.ZIP_INPUT_PASSWORD;
 if (process.env.ZIP_PASSWORD_MODE)
   config.zipPasswordMode = process.env.ZIP_PASSWORD_MODE;
+if (process.env.MEGA_ACCOUNTS) {
+  const accounts = process.env.MEGA_ACCOUNTS.split(',').map(pair => {
+    const [email, password] = pair.split(':').map(s => s.trim());
+    return email && password ? { email, password } : null;
+  }).filter(Boolean);
+  if (accounts.length > 0) config.megaAccounts = accounts;
+}
 
 // ── Folder paths ──────────────────────────────────────────────────────────────
 // Railway's /app is read-only after deploy. Detect this and use /tmp instead.
