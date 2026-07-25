@@ -181,6 +181,23 @@ function resetAccountQuotas() {
   }
 }
 
+/**
+ * Returns storage instances for all configured accounts
+ */
+async function getAllAccountStorages(config) {
+  const accounts = getAccountList(config);
+  const results = [];
+  for (const acc of accounts) {
+    try {
+      const storage = await getStorageForAccount(acc);
+      results.push({ email: acc.email, storage });
+    } catch (err) {
+      console.error(`[megaUploader] Could not load storage for ${acc.email}: ${err.message}`);
+    }
+  }
+  return results;
+}
+
 module.exports = {
   uploadToMega,
   getStorageForConfig: async (config) => {
@@ -188,5 +205,6 @@ module.exports = {
     if (accounts.length === 0) throw new Error('No MEGA accounts configured.');
     return getStorageForAccount(accounts[0]);
   },
+  getAllAccountStorages,
   resetAccountQuotas,
 };

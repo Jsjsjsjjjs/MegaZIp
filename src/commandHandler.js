@@ -214,6 +214,17 @@ async function registerCommands(config) {
           .setRequired(false)
       )
       .toJSON(),
+
+    // ── /cleanlink — Clean unused & duplicate MEGA links from storage ──────────
+    new SlashCommandBuilder()
+      .setName('cleanlink')
+      .setDescription('Scan target server & delete unused/duplicate files from MEGA storage (owner only)')
+      .addBooleanOption(o =>
+        o.setName('dryrun')
+          .setDescription('true = preview files to be deleted without actually deleting (default: false)')
+          .setRequired(false)
+      )
+      .toJSON(),
   ];
 
   const rest = new REST({ version: '10' }).setToken(config.discordToken);
@@ -935,6 +946,137 @@ function attachCommandHandler(client, config, {
         if (mirrorControls.start) mirrorControls.start();
       } catch (err) {
         await interaction.editReply({ content: `❌ Recovery failed: ${err.message}` });
+      }
+      return;
+    }
+
+    // ── /cleanlink — Delete unused & duplicate files from MEGA storage ─────────
+    if (cmd === 'cleanlink') {
+      const dryRun = interaction.options.getBoolean('dryrun') ?? false;
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      try {
+        await interaction.editReply({ content: '🔍 Scanning target server channels for active MEGA links...' });
+
+        const guild = await client.guilds.fetch(config.guildId);
+        await guild.channels.fetch();
+
+        const textChannels = [...guild.channels.cache.values()].filter(
+          ch => ch && (ch.type === ChannelType.GuildText || ch.type === 0)
+        );
+
+        const activeMegaLinks = new Set();
+        const activeMegaKeys  = new Set();
+
+        const { extractMegaKey } = require('./discordManager');
+
+        let scannedChannels = 0;
+        for (const ch of textChannels) {
+          try {
+            const msgs = await ch.messages.fetch({ limit: 100 });
+            for (const msg of msgs.values()) {
+              const texts = [msg.content || ''];
+              for (const e of msg.embeds || []) texts.push(flattenEmbed(e));
+              for (const text of texts) {
+                for (const link of extractMegaLinks(text)) {
+                  const normLink = link.replace(/\/$/, '').toLowerCase().trim();
+                  activeMegaLinks.add(normLink);
+                  const key = extractMegaKey(link);
+                  if (key) activeMegaKeys.add(key.toLowerCase());
+                }
+              }
+            }
+            scannedChannels++;
+          } catch { /* skip inaccessible channels */ }
+        }
+
+        await interaction.editReply({
+          content: `🔍 Found **${activeMegaLinks.size}** active MEGA link(s) across **${scannedChannels}** text channel(s).\n🔐 Connecting to your MEGA account(s)...`
+        });
+
+        const { getAllAccountStorages } = require('./megaUploader');
+        const accountStorages = await getAllAccountStorages(config);
+
+        if (accountStorages.length === 0) {
+          await interaction.editReply({ content: '❌ No valid MEGA account storage sessions available.' });
+          return;
+        }
+
+        let totalMegaFiles = 0;
+        let deletedCount = 0;
+        let keptCount = 0;
+        const deletedFileNames = [];
+        const keptKeysInAccount = new Set();
+
+        for (const { email, storage } of accountStorages) {
+          const files = Object.values(storage.files || {}).filter(f => f && !f.directory && f.name);
+          totalMegaFiles += files.length;
+
+          for (const file of files) {
+            let fileLink = '';
+            try {
+              fileLink = await file.link(false);
+            } catch {
+              fileLink = '';
+            }
+
+            const normFileLink = fileLink ? fileLink.replace(/\/$/, '').toLowerCase().trim() : '';
+            const key = extractMegaKey(fileLink);
+            const normKey = key ? key.toLowerCase() : '';
+
+            const isActive = (normFileLink && activeMegaLinks.has(normFileLink)) || (normKey && activeMegaKeys.has(normKey));
+            
+            // Deduplicate in MEGA storage: keep only 1 working file copy per active link
+            const linkIdentifier = normKey || normFileLink || file.name;
+            const isDuplicate = keptKeysInAccount.has(linkIdentifier);
+
+            if (isActive && !isDuplicate) {
+              keptCount++;
+              if (linkIdentifier) keptKeysInAccount.add(linkIdentifier);
+            } else {
+              // Delete or flag for deletion
+              const reasonLabel = isDuplicate ? 'duplicate' : 'unused';
+              deletedFileNames.push(`• **${file.name}** (${email} — ${reasonLabel})`);
+              if (!dryRun) {
+                try {
+                  await file.delete(true); // permanent delete
+                  await new Promise(r => setTimeout(r, 300));
+                } catch (err) {
+                  console.error(`[cleanlink] Failed to delete file ${file.name}: ${err.message}`);
+                }
+              }
+              deletedCount++;
+            }
+          }
+        }
+
+        const modeText = dryRun ? '🔍 **Dry Run Complete (No files were deleted):**' : '🗑️ **MEGA Storage Cleanup Complete!**';
+        const actionText = dryRun ? 'Would Delete' : 'Deleted';
+
+        const lines = [
+          modeText,
+          `• Target Text Channels Scanned: **${scannedChannels}**`,
+          `• Active Links in Discord: **${activeMegaLinks.size}**`,
+          `• MEGA Accounts Checked: **${accountStorages.length}**`,
+          `• Total Files in MEGA Storage: **${totalMegaFiles}**`,
+          `• Kept Working Copies: **${keptCount}**`,
+          `• ${actionText} Unused/Duplicate Files: **${deletedCount}**`,
+        ];
+
+        if (deletedFileNames.length > 0) {
+          lines.push('', `**${actionText} Files List:**`);
+          lines.push(...deletedFileNames.slice(0, 25));
+          if (deletedFileNames.length > 25) {
+            lines.push(`…and ${deletedFileNames.length - 25} more file(s)`);
+          }
+        } else {
+          lines.push('', '✨ All files in your MEGA account(s) are active in Discord! No cleanup needed.');
+        }
+
+        await interaction.editReply({ content: lines.join('\n').slice(0, 1950) });
+
+      } catch (err) {
+        await interaction.editReply({ content: `❌ Cleanlink error: ${err.message}` });
       }
       return;
     }
