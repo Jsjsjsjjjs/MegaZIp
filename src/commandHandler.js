@@ -1013,21 +1013,14 @@ function attachCommandHandler(client, config, {
           totalMegaFiles += files.length;
 
           for (const file of files) {
-            let fileLink = '';
-            try {
-              fileLink = await file.link(false);
-            } catch {
-              fileLink = '';
-            }
+            // Compute decryption key locally from buffer (instant 0ms execution without API call)
+            const localKey = file.key ? file.key.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '') : '';
+            const normKey = localKey ? localKey.toLowerCase() : '';
 
-            const normFileLink = fileLink ? fileLink.replace(/\/$/, '').toLowerCase().trim() : '';
-            const key = extractMegaKey(fileLink);
-            const normKey = key ? key.toLowerCase() : '';
-
-            const isActive = (normFileLink && activeMegaLinks.has(normFileLink)) || (normKey && activeMegaKeys.has(normKey));
+            const isActive = normKey && activeMegaKeys.has(normKey);
             
-            // Deduplicate in MEGA storage: keep only 1 working file copy per active link
-            const linkIdentifier = normKey || normFileLink || file.name;
+            // Deduplicate in MEGA storage: keep only 1 working file copy per active key/name
+            const linkIdentifier = normKey || file.name.toLowerCase();
             const isDuplicate = keptKeysInAccount.has(linkIdentifier);
 
             if (isActive && !isDuplicate) {
@@ -1039,8 +1032,14 @@ function attachCommandHandler(client, config, {
               deletedFileNames.push(`• **${file.name}** (${email} — ${reasonLabel})`);
               if (!dryRun) {
                 try {
-                  await file.delete(true); // permanent delete
-                  await new Promise(r => setTimeout(r, 300));
+                  // Use raw API request for 100% reliable permanent delete (avoids megajs wrapper fetch error)
+                  await new Promise((resolve, reject) => {
+                    storage.api.request({ a: 'd', n: file.nodeId }, (err, res) => {
+                      if (err) return reject(err);
+                      resolve(res);
+                    });
+                  });
+                  await new Promise(r => setTimeout(r, 150));
                 } catch (err) {
                   console.error(`[cleanlink] Failed to delete file ${file.name}: ${err.message}`);
                 }
