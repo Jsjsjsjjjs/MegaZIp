@@ -168,7 +168,13 @@ async function processLink(entry, config) {
   if (_aborted) return;
 
   const { link, name, displayName, categoryName } = entry;
-  // Bug Fix 1: use displayName if available (includes suffix for multi-link channels), fallback to name
+
+  // Guard: skip entries without a link (e.g. old/test state entries)
+  if (!link) {
+    console.warn(`[mirrorEngine] Skipping entry "${name || 'unknown'}" — no MEGA link in state.`);
+    return;
+  }
+
   const effectiveName = displayName || name;
   const mc = config.mirrorEngine;
   const sourcePassword = mc.sourcePassword || null;
@@ -196,7 +202,10 @@ async function processLink(entry, config) {
     // Check abort after slow download
     if (_aborted) return;
 
-    const baseName = safeName(effectiveName);
+    // Use actual downloaded filename when available, fallback to effectiveName
+    const baseName = remoteName
+      ? path.basename(remoteName, path.extname(remoteName))
+      : safeName(effectiveName);
     const remoteExt = remoteName ? path.extname(remoteName).toLowerCase() : '';
     const isZip     = remoteExt === '.zip';
 
